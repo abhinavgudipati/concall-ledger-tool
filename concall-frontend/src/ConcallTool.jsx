@@ -633,8 +633,9 @@ async function extractViaBackend(file, columns) {
   formData.append("file", file);
 
   const params = new URLSearchParams({ columns: columns.join(",") });
-  const response = await fetch(`${API_BASE_URL}/extract?${params.toString()}`, {
-    method: "POST",
+  // Check your fetch or axios paths. It should look like this:
+  const response = await fetch(`${import.meta.env.VITE_API_URL}/extract-batch`, {
+    method: 'POST',
     body: formData,
   });
 
