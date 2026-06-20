@@ -1,0 +1,21 @@
+# Environment variables / secrets — never commit these
+.env
+.env.local
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+venv/
+env/
+.venv/
+
+# Conda
+*.conda
+
+# OS / editor cruft
+.DS_Store
+.vscode/
+.idea/
