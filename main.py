@@ -9,16 +9,25 @@ Then open http://localhost:8000/docs for an interactive API tester.
 
 import io
 import json
+import logging
 import os
+import time
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pypdf import PdfReader
 
 from google import genai
 from google.genai import types as genai_types
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("concall")
 
 load_dotenv()
 
@@ -64,12 +73,22 @@ class ExtractResponse(BaseModel):
 
 def extract_pdf_text(file_bytes: bytes) -> str:
     """Pull plain text out of a PDF using pypdf. Returns '' if the PDF is image-only."""
-    reader = PdfReader(io.BytesIO(file_bytes))
-    text_parts = []
-    for page in reader.pages:
-        page_text = page.extract_text() or ""
-        text_parts.append(page_text)
-    return "\n".join(text_parts).strip()
+    start = time.monotonic()
+    logger.info(f"PDF parse starting, file size: {len(file_bytes)} bytes")
+    try:
+        reader = PdfReader(io.BytesIO(file_bytes))
+        text_parts = []
+        for page in reader.pages:
+            page_text = page.extract_text() or ""
+            text_parts.append(page_text)
+        text = "\n".join(text_parts).strip()
+        elapsed = time.monotonic() - start
+        logger.info(f"PDF parse finished in {elapsed:.2f}s, extracted {len(text)} chars, {len(reader.pages)} pages")
+        return text
+    except Exception:
+        elapsed = time.monotonic() - start
+        logger.exception(f"PDF parse FAILED after {elapsed:.2f}s")
+        raise
 
 
 def build_prompt(columns: list[str], transcript_text: str) -> str:
@@ -100,21 +119,32 @@ def call_gemini(prompt: str, columns: list[str]) -> dict:
         "required": columns,
     }
 
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-        config=genai_types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=response_schema,
-        ),
-    )
+    start = time.monotonic()
+    logger.info(f"Gemini call starting, prompt length: {len(prompt)} chars, model: {MODEL_NAME}")
+    try:
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=response_schema,
+            ),
+        )
+        elapsed = time.monotonic() - start
+        logger.info(f"Gemini call finished in {elapsed:.2f}s")
+    except Exception:
+        elapsed = time.monotonic() - start
+        logger.exception(f"Gemini call FAILED/RAISED after {elapsed:.2f}s")
+        raise
 
     if not response.text:
+        logger.error(f"Gemini returned empty text. Full response object: {response}")
         raise ValueError("Gemini returned no text content")
 
     try:
         row = json.loads(response.text)
     except json.JSONDecodeError as e:
+        logger.error(f"Could not parse Gemini output as JSON. Raw text: {response.text[:1000]}")
         raise ValueError(f"Could not parse model output as JSON: {e}\nRaw: {response.text[:500]}")
 
     return row
@@ -135,6 +165,8 @@ def _resolve_columns(columns: str | None) -> list[str]:
 
 def _extract_one(filename: str, file_bytes: bytes, active_columns: list[str]) -> dict:
     """Shared logic for a single file. Raises HTTPException on failure."""
+    logger.info(f"=== Starting extraction for '{filename}' ===")
+
     if not filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported right now.")
 
@@ -154,8 +186,10 @@ def _extract_one(filename: str, file_bytes: bytes, active_columns: list[str]) ->
     try:
         row = call_gemini(prompt, active_columns)
     except Exception as e:
+        logger.error(f"Extraction failed for '{filename}': {type(e).__name__}: {e}")
         raise HTTPException(status_code=502, detail=f"Extraction failed: {e}")
 
+    logger.info(f"=== Finished extraction for '{filename}' successfully ===")
     return row
 
 
@@ -166,7 +200,11 @@ async def extract_transcript(
 ):
     active_columns = _resolve_columns(columns)
     file_bytes = await file.read()
-    row = _extract_one(file.filename, file_bytes, active_columns)
+    # _extract_one makes a blocking (synchronous) call to the Gemini SDK.
+    # Running it via run_in_threadpool keeps the event loop free to respond
+    # to health checks and other requests while this one is in flight —
+    # without this, a slow model call can stall the whole server.
+    row = await run_in_threadpool(_extract_one, file.filename, file_bytes, active_columns)
     return ExtractResponse(filename=file.filename, row=row)
 
 
@@ -197,7 +235,7 @@ async def extract_transcripts_batch(
     for f in files:
         file_bytes = await f.read()
         try:
-            row = _extract_one(f.filename, file_bytes, active_columns)
+            row = await run_in_threadpool(_extract_one, f.filename, file_bytes, active_columns)
             results.append(BatchRowResult(filename=f.filename, ok=True, row=row))
         except HTTPException as e:
             results.append(BatchRowResult(filename=f.filename, ok=False, error=str(e.detail)))
