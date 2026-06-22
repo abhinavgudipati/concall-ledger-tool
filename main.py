@@ -69,6 +69,11 @@ MAX_TRANSCRIPT_CHARS = 100_000  # rough cap to keep prompts within model context
 MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024  # 25MB cap on fetched PDFs to avoid abuse/huge files
 DOWNLOAD_TIMEOUT_SECONDS = 20
 
+# A marker we inject between pages of the transcript before sending it to
+# the model. The model is told (in the prompt) what this marker means, so
+# it can report which page a given source_quote was found on.
+PAGE_MARKER_TEMPLATE = "\n\n[[PAGE {n}]]\n\n"
+
 
 class ExtractResponse(BaseModel):
     filename: str
@@ -139,16 +144,20 @@ def download_pdf_from_url(url: str) -> bytes:
 
 
 def extract_pdf_text(file_bytes: bytes) -> str:
-    """Pull plain text out of a PDF using pypdf. Returns '' if the PDF is image-only."""
+    """
+    Pull plain text out of a PDF using pypdf. Returns '' if the PDF is
+    image-only. Each page's text is preceded by a [[PAGE n]] marker (n is
+    1-indexed) so the model can cite which page a quote came from.
+    """
     start = time.monotonic()
     logger.info(f"PDF parse starting, file size: {len(file_bytes)} bytes")
     try:
         reader = PdfReader(io.BytesIO(file_bytes))
         text_parts = []
-        for page in reader.pages:
+        for i, page in enumerate(reader.pages, start=1):
             page_text = page.extract_text() or ""
-            text_parts.append(page_text)
-        text = "\n".join(text_parts).strip()
+            text_parts.append(PAGE_MARKER_TEMPLATE.format(n=i) + page_text)
+        text = "".join(text_parts).strip()
         elapsed = time.monotonic() - start
         logger.info(f"PDF parse finished in {elapsed:.2f}s, extracted {len(text)} chars, {len(reader.pages)} pages")
         return text
@@ -178,11 +187,16 @@ RULES:
 - Keep each value under 20 words
 - "Company Name" should be the actual company name found in the transcript
 
+PAGE MARKERS:
+- The transcript below contains markers like "[[PAGE 4]]" inserted at the start of each page. These markers are NOT part of the actual transcript content — never quote them or include them in any value or source_quote.
+- Use them only to determine which page number a given source_quote falls on (the page whose marker appears immediately before the quoted text in the document).
+
 CITATIONS — for each of these fields: {citation_field_list}
 - Also provide a "source_quote": a short, VERBATIM excerpt (under 20 words, copied exactly, no paraphrasing) from the transcript that the value was drawn from.
-- If the value is "No explicit guidance", set source_quote to an empty string "".
-- For "Key Takeaway" (a synthesized summary, not a direct quote), source_quote should be the single most representative verbatim sentence from the transcript that best supports the takeaway.
-- Never invent or paraphrase a quote — if you cannot find an exact supporting sentence, set source_quote to "".
+- Also provide a "source_page": the integer page number (from the nearest preceding [[PAGE n]] marker) where that source_quote appears.
+- If the value is "No explicit guidance", set source_quote to an empty string "" and source_page to 0.
+- For "Key Takeaway" (a synthesized summary, not a direct quote), source_quote should be the single most representative verbatim sentence from the transcript that best supports the takeaway, and source_page its page number.
+- Never invent or paraphrase a quote — if you cannot find an exact supporting sentence, set source_quote to "" and source_page to 0.
 
 TRANSCRIPT:
 {transcript_text[:MAX_TRANSCRIPT_CHARS]}"""
@@ -190,8 +204,8 @@ TRANSCRIPT:
 
 def call_gemini(prompt: str, columns: list[str]) -> dict:
     # Build a strict JSON schema. Every field except "Quarter and Year" is
-    # returned as {value, source_quote} so the UI can show where each
-    # extracted fact actually came from in the transcript.
+    # returned as {value, source_quote, source_page} so the UI can show
+    # where each extracted fact came from in the transcript, page included.
     properties = {}
     for c in columns:
         if c == "Quarter and Year":
@@ -202,8 +216,9 @@ def call_gemini(prompt: str, columns: list[str]) -> dict:
                 "properties": {
                     "value": {"type": "string"},
                     "source_quote": {"type": "string"},
+                    "source_page": {"type": "integer"},
                 },
-                "required": ["value", "source_quote"],
+                "required": ["value", "source_quote", "source_page"],
             }
 
     response_schema = {
