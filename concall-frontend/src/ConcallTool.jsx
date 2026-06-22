@@ -18,6 +18,8 @@ const DEFAULT_COLUMNS = [
   "Key Takeaway",
 ];
 
+const MAX_CONCURRENT = 3;
+
 const THEMES = {
   light: {
     bg: "#FAFAF8",
@@ -53,17 +55,14 @@ const THEMES = {
   },
 };
 
-function buildPrompt() {} // (unused placeholder removed below — kept tree-shake friendly)
-
 async function extractViaBackend(file, columns) {
   const formData = new FormData();
   formData.append("file", file);
 
   const params = new URLSearchParams({ columns: columns.join(",") });
-  
-  // FIXED: Uses API_BASE_URL and points to /extract
+
   const response = await fetch(`${API_BASE_URL}/extract?${params.toString()}`, {
-    method: 'POST',
+    method: "POST",
     body: formData,
   });
 
@@ -89,6 +88,19 @@ const STATUS = {
   ERROR: "error",
 };
 
+// Most fields come back as { value, source_quote }; "Quarter and Year"
+// comes back as a plain string. These helpers handle both shapes safely.
+function getCellValue(cellData) {
+  if (cellData == null) return "";
+  if (typeof cellData === "string") return cellData;
+  return cellData.value || "";
+}
+
+function getCellSource(cellData) {
+  if (cellData == null || typeof cellData === "string") return "";
+  return cellData.source_quote || "";
+}
+
 export default function ConcallTool() {
   const [theme, setTheme] = useState("light");
   const t = THEMES[theme];
@@ -98,10 +110,18 @@ export default function ConcallTool() {
   const [columnDraft, setColumnDraft] = useState(DEFAULT_COLUMNS.join(", "));
   const [files, setFiles] = useState([]);
   const [rows, setRows] = useState([]);
+  const [expandedRows, setExpandedRows] = useState(new Set());
   const [isDragging, setIsDragging] = useState(false);
   const [copyState, setCopyState] = useState("idle"); // idle | copied
   const fileInputRef = useRef(null);
   const idCounter = useRef(0);
+
+  // Tracks which file entries are currently queued/in-flight so the
+  // concurrency-limited runner below knows what's left to pick up.
+  const queueRef = useRef([]);
+  const activeWorkersRef = useRef(0);
+  const columnsRef = useRef(columns);
+  columnsRef.current = columns;
 
   const addFiles = useCallback((fileList) => {
     const pdfFiles = Array.from(fileList).filter((f) =>
@@ -118,32 +138,50 @@ export default function ConcallTool() {
     return entries;
   }, []);
 
+  const processOne = useCallback(async (entry) => {
+    setFiles((prev) =>
+      prev.map((f) => (f.id === entry.id ? { ...f, status: STATUS.EXTRACTING } : f))
+    );
+    try {
+      const rowData = await extractViaBackend(entry.file, columnsRef.current);
+      const rowId = ++idCounter.current;
+      setRows((prev) => [
+        ...prev,
+        { id: rowId, fileName: entry.name, data: rowData, mintedAt: Date.now() },
+      ]);
+      setFiles((prev) =>
+        prev.map((f) => (f.id === entry.id ? { ...f, status: STATUS.DONE } : f))
+      );
+    } catch (err) {
+      setFiles((prev) =>
+        prev.map((f) =>
+          f.id === entry.id ? { ...f, status: STATUS.ERROR, error: err.message } : f
+        )
+      );
+    }
+  }, []);
+
+  // Concurrency-limited runner: keeps up to MAX_CONCURRENT extractions
+  // in flight at once. As each one finishes, it immediately pulls the
+  // next queued entry, so a batch of N files completes in roughly
+  // N / MAX_CONCURRENT round-trips instead of N sequential ones.
+  const pump = useCallback(() => {
+    while (activeWorkersRef.current < MAX_CONCURRENT && queueRef.current.length > 0) {
+      const entry = queueRef.current.shift();
+      activeWorkersRef.current += 1;
+      processOne(entry).finally(() => {
+        activeWorkersRef.current -= 1;
+        pump();
+      });
+    }
+  }, [processOne]);
+
   const processQueue = useCallback(
-    async (entries) => {
-      for (const entry of entries) {
-        setFiles((prev) =>
-          prev.map((f) => (f.id === entry.id ? { ...f, status: STATUS.EXTRACTING } : f))
-        );
-        try {
-          const rowData = await extractViaBackend(entry.file, columns);
-          const rowId = ++idCounter.current;
-          setRows((prev) => [
-            ...prev,
-            { id: rowId, fileName: entry.name, data: rowData, mintedAt: Date.now() },
-          ]);
-          setFiles((prev) =>
-            prev.map((f) => (f.id === entry.id ? { ...f, status: STATUS.DONE } : f))
-          );
-        } catch (err) {
-          setFiles((prev) =>
-            prev.map((f) =>
-              f.id === entry.id ? { ...f, status: STATUS.ERROR, error: err.message } : f
-            )
-          );
-        }
-      }
+    (entries) => {
+      queueRef.current.push(...entries);
+      pump();
     },
-    [columns]
+    [pump]
   );
 
   const handleFiles = useCallback(
@@ -167,9 +205,23 @@ export default function ConcallTool() {
     const header = `| ${columns.join(" | ")} |`;
     const sep = `| ${columns.map(() => "---").join(" | ")} |`;
     const body = rows
-      .map((r) => `| ${columns.map((c) => (r.data[c] || "").replace(/\|/g, "/")).join(" | ")} |`)
+      .map(
+        (r) =>
+          `| ${columns
+            .map((c) => getCellValue(r.data[c]).replace(/\|/g, "/"))
+            .join(" | ")} |`
+      )
       .join("\n");
     return [header, sep, body].join("\n");
+  };
+
+  const toggleRowExpanded = (rowId) => {
+    setExpandedRows((prev) => {
+      const next = new Set(prev);
+      if (next.has(rowId)) next.delete(rowId);
+      else next.add(rowId);
+      return next;
+    });
   };
 
   const copyTable = async () => {
@@ -185,7 +237,9 @@ export default function ConcallTool() {
   const removeRow = (id) => setRows((prev) => prev.filter((r) => r.id !== id));
   const removeFile = (id) => setFiles((prev) => prev.filter((f) => f.id !== id));
   const retryFile = (entry) => {
-    setFiles((prev) => prev.map((f) => (f.id === entry.id ? { ...f, status: STATUS.QUEUED, error: null } : f)));
+    setFiles((prev) =>
+      prev.map((f) => (f.id === entry.id ? { ...f, status: STATUS.QUEUED, error: null } : f))
+    );
     processQueue([entry]);
   };
 
@@ -195,7 +249,9 @@ export default function ConcallTool() {
     setEditingColumns(false);
   };
 
-  const activeCount = files.filter((f) => f.status === STATUS.EXTRACTING || f.status === STATUS.QUEUED).length;
+  const activeCount = files.filter(
+    (f) => f.status === STATUS.EXTRACTING || f.status === STATUS.QUEUED
+  ).length;
 
   return (
     <div
@@ -303,7 +359,10 @@ export default function ConcallTool() {
 
           <div style={{ display: "flex", alignItems: "center", gap: "18px" }}>
             <span className="mono" style={{ fontSize: "11.5px", opacity: 0.6 }}>
-              {rows.length} extracted{activeCount > 0 ? ` · ${activeCount} in progress` : ""}
+              {rows.length} extracted
+              {activeCount > 0
+                ? ` · ${activeCount} in queue (up to ${MAX_CONCURRENT} at once)`
+                : ""}
             </span>
             <button
               onClick={() => setTheme(theme === "light" ? "dark" : "light")}
@@ -513,10 +572,10 @@ export default function ConcallTool() {
             }}
           />
           <div style={{ fontSize: "14.5px", fontWeight: 600, marginBottom: "4px", color: t.ink }}>
-            Drop transcript PDFs here, or click to browse
+            Drop transcript PDFs here, or click to browse — multiple at once is fine
           </div>
           <div className="mono" style={{ fontSize: "11.5px", color: t.inkFaint }}>
-            each file is read independently · a failed PDF won't block the rest
+            up to {MAX_CONCURRENT} processed at a time · a failed PDF won't block the rest
           </div>
         </div>
 
@@ -529,7 +588,8 @@ export default function ConcallTool() {
             {files.map((f) => {
               const isError = f.status === STATUS.ERROR;
               const isDone = f.status === STATUS.DONE;
-              const isActive = f.status === STATUS.EXTRACTING || f.status === STATUS.QUEUED;
+              const isExtracting = f.status === STATUS.EXTRACTING;
+              const isQueued = f.status === STATUS.QUEUED;
               return (
                 <div
                   key={f.id}
@@ -546,10 +606,11 @@ export default function ConcallTool() {
                     gap: "7px",
                     maxWidth: "260px",
                     color: t.ink,
+                    opacity: isQueued ? 0.6 : 1,
                   }}
                   title={f.error || f.name}
                 >
-                  {isActive && (
+                  {isExtracting && (
                     <svg className="spinner" width="11" height="11" viewBox="0 0 24 24" style={{ flexShrink: 0 }}>
                       <circle
                         cx="12" cy="12" r="9" fill="none"
@@ -558,6 +619,7 @@ export default function ConcallTool() {
                       />
                     </svg>
                   )}
+                  {isQueued && <span style={{ color: t.inkFaint, flexShrink: 0 }}>⋯</span>}
                   {isDone && <span style={{ color: t.accent, flexShrink: 0 }}>✓</span>}
                   {isError && <span style={{ color: t.rust, flexShrink: 0 }}>✕</span>}
                   <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -623,53 +685,132 @@ export default function ConcallTool() {
               <tbody>
                 {rows.map((r, idx) => {
                   const isFresh = Date.now() - r.mintedAt < 900;
+                  const isExpanded = expandedRows.has(r.id);
+                  const citableColumns = columns.filter((c) => c !== "Quarter and Year");
+                  const hasAnySource = citableColumns.some((c) => getCellSource(r.data[c]));
                   return (
-                    <tr
-                      key={r.id}
-                      className={isFresh ? "print-in" : ""}
-                      style={{
-                        background: idx % 2 === 0 ? t.panel : t.bgSubtle,
-                        borderBottom: `1px solid ${t.hairline}`,
-                      }}
-                    >
-                      {columns.map((c) => {
-                        const isTakeaway = c.toLowerCase().includes("takeaway");
-                        const isRisk = c.toLowerCase().includes("risk");
-                        return (
-                          <td
-                            key={c}
+                    <React.Fragment key={r.id}>
+                      <tr
+                        className={isFresh ? "print-in" : ""}
+                        style={{
+                          background: idx % 2 === 0 ? t.panel : t.bgSubtle,
+                          borderBottom: isExpanded ? "none" : `1px solid ${t.hairline}`,
+                        }}
+                      >
+                        {columns.map((c) => {
+                          const isTakeaway = c.toLowerCase().includes("takeaway");
+                          const isRisk = c.toLowerCase().includes("risk");
+                          const cellValue = getCellValue(r.data[c]);
+                          return (
+                            <td
+                              key={c}
+                              style={{
+                                padding: "11px 16px",
+                                verticalAlign: "top",
+                                maxWidth: "260px",
+                                fontWeight: c === "Company Name" ? 600 : 400,
+                                color:
+                                  isRisk && cellValue && cellValue !== "No explicit guidance"
+                                    ? t.rust
+                                    : t.ink,
+                              }}
+                            >
+                              {cellValue ? (
+                                <span
+                                  className={isTakeaway ? "takeaway-mark" : ""}
+                                  style={isTakeaway ? { "--mark-color": t.accentBg } : undefined}
+                                >
+                                  {cellValue}
+                                </span>
+                              ) : (
+                                <span style={{ color: t.inkFaint }} className="mono">
+                                  —
+                                </span>
+                              )}
+                            </td>
+                          );
+                        })}
+                        <td style={{ padding: "11px 6px", textAlign: "right", whiteSpace: "nowrap" }}>
+                          {hasAnySource && (
+                            <button
+                              onClick={() => toggleRowExpanded(r.id)}
+                              className="icon-btn"
+                              style={{
+                                background: "none",
+                                border: "none",
+                                color: isExpanded ? t.accent : t.inkFaint,
+                                opacity: isExpanded ? 1 : 0.6,
+                                cursor: "pointer",
+                                fontSize: "11px",
+                                padding: "0 6px",
+                              }}
+                              aria-label={isExpanded ? "Hide sources" : "Show sources"}
+                              title={isExpanded ? "Hide sources" : "Show sources"}
+                            >
+                              {isExpanded ? "▾ source" : "▸ source"}
+                            </button>
+                          )}
+                          <button
+                            onClick={() => removeRow(r.id)}
+                            className="icon-btn"
                             style={{
-                              padding: "11px 16px",
-                              verticalAlign: "top",
-                              maxWidth: "260px",
-                              fontWeight: c === "Company Name" ? 600 : 400,
-                              color: isRisk && r.data[c] && r.data[c] !== "No explicit guidance" ? t.rust : t.ink,
+                              background: "none",
+                              border: "none",
+                              color: t.inkFaint,
+                              opacity: 0.5,
+                              cursor: "pointer",
+                              fontSize: "14px",
+                            }}
+                            aria-label={`Remove row for ${getCellValue(r.data["Company Name"]) || r.fileName}`}
+                          >
+                            ×
+                          </button>
+                        </td>
+                      </tr>
+                      {isExpanded && (
+                        <tr style={{ borderBottom: `1px solid ${t.hairline}` }}>
+                          <td
+                            colSpan={columns.length + 1}
+                            style={{
+                              padding: "4px 16px 14px",
+                              background: idx % 2 === 0 ? t.panel : t.bgSubtle,
                             }}
                           >
-                            {r.data[c] ? (
-                              <span
-                                className={isTakeaway ? "takeaway-mark" : ""}
-                                style={isTakeaway ? { "--mark-color": t.accentBg } : undefined}
-                              >
-                                {r.data[c]}
-                              </span>
-                            ) : (
-                              <span style={{ color: t.inkFaint }} className="mono">—</span>
-                            )}
+                            <div
+                              style={{
+                                borderLeft: `2px solid ${t.hairlineStrong}`,
+                                paddingLeft: "14px",
+                                display: "flex",
+                                flexDirection: "column",
+                                gap: "6px",
+                              }}
+                            >
+                              {citableColumns.map((c) => {
+                                const quote = getCellSource(r.data[c]);
+                                if (!quote) return null;
+                                return (
+                                  <div key={c} style={{ fontSize: "11.5px" }}>
+                                    <span
+                                      className="mono"
+                                      style={{
+                                        color: t.inkFaint,
+                                        letterSpacing: "0.04em",
+                                        marginRight: "8px",
+                                      }}
+                                    >
+                                      {c.toUpperCase()}
+                                    </span>
+                                    <span style={{ color: t.inkMuted, fontStyle: "italic" }}>
+                                      "{quote}"
+                                    </span>
+                                  </div>
+                                );
+                              })}
+                            </div>
                           </td>
-                        );
-                      })}
-                      <td style={{ padding: "11px 6px", textAlign: "right" }}>
-                        <button
-                          onClick={() => removeRow(r.id)}
-                          className="icon-btn"
-                          style={{ background: "none", border: "none", color: t.inkFaint, opacity: 0.5, cursor: "pointer", fontSize: "14px" }}
-                          aria-label={`Remove row for ${r.data["Company Name"] || r.fileName}`}
-                        >
-                          ×
-                        </button>
-                      </td>
-                    </tr>
+                        </tr>
+                      )}
+                    </React.Fragment>
                   );
                 })}
               </tbody>
