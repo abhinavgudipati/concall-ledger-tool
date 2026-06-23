@@ -261,7 +261,7 @@
 //   const exportPDF = () => {
 //     const doc = new jsPDF({ orientation: "landscape", unit: "pt", format: "a4" });
 //     doc.setFontSize(14);
-//     doc.text("Concall Insight Extractor — Ledger", 32, 28);
+//     doc.text("Concalls.in — Management Guidance Tracker", 32, 28);
 //     autoTable(doc, {
 //       startY: 42,
 //       head: [columns],
@@ -980,6 +980,8 @@ import React, { useState, useCallback, useRef, useEffect } from "react";
 import * as XLSX from "xlsx";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
+import { supabase } from "./supabase";
+import SignInPage from "./SignInPage";
 
 // Backend base URL. Defaults to local dev; override at build time with
 // VITE_API_BASE_URL (Vite) or REACT_APP_API_BASE_URL (CRA) once deployed.
@@ -1036,7 +1038,12 @@ const THEMES = {
   },
 };
 
-async function extractViaBackend(file, columns) {
+async function authHeaders(session) {
+  if (!session?.access_token) return {};
+  return { Authorization: `Bearer ${session.access_token}` };
+}
+
+async function extractViaBackend(file, columns, session) {
   const formData = new FormData();
   formData.append("file", file);
 
@@ -1045,6 +1052,7 @@ async function extractViaBackend(file, columns) {
   const response = await fetch(`${API_BASE_URL}/extract?${params.toString()}`, {
     method: "POST",
     body: formData,
+    headers: await authHeaders(session),
   });
 
   if (!response.ok) {
@@ -1052,14 +1060,62 @@ async function extractViaBackend(file, columns) {
     try {
       const errBody = await response.json();
       if (errBody?.detail) detail = errBody.detail;
-    } catch (_) {
-      // response wasn't JSON — keep generic message
-    }
+    } catch (_) {}
     throw new Error(detail);
   }
 
   const data = await response.json();
   return data.row || {};
+}
+
+function previousAdjacentQuarter(quarterYear) {
+  const m = quarterYear && quarterYear.match(/^Q([1-4])-(\d{4})$/);
+  if (!m) return null;
+  const n = parseInt(m[1]), year = parseInt(m[2]);
+  return n === 1 ? `Q4-${year - 1}` : `Q${n - 1}-${year}`;
+}
+
+const CONSISTENCY_DISPLAY = {
+  REAFFIRMED: { label: "↔ Unchanged",  color: "#1F7A4D" },
+  CHANGED:    { label: "↑↓ Revised",   color: "#B45309" },
+  DROPPED:    { label: "✗ Withdrawn",  color: "#9B3E3E" },
+  RESUMED:    { label: "↩ Reinstated", color: "#2563EB" },
+};
+
+const CONFIDENCE_DISPLAY = {
+  HIGH:   { label: "HIGH",  color: "#1F7A4D" },
+  MEDIUM: { label: "MED",   color: "#B45309" },
+  LOW:    { label: "LOW",   color: "#9B3E3E" },
+  "N/A":  { label: "N/A",  color: "#9B9D94" },
+};
+
+async function fetchConsistencyForRow(rowData, columns, session) {
+  const companyField = rowData["Company Name"];
+  const companyName = typeof companyField === "object" ? companyField.value : companyField;
+  const quarterYear = rowData["Quarter and Year"] || "";
+  if (!companyName || !quarterYear) return {};
+
+  const headers = await authHeaders(session);
+  const citable = columns.filter((c) => c !== "Quarter and Year" && rowData[c]?.value);
+  const results = await Promise.allSettled(
+    citable.map(async (fieldName) => {
+      const value = rowData[fieldName]?.value || "";
+      const params = new URLSearchParams({ company_name: companyName, field_name: fieldName, current_value: value, current_quarter_year: quarterYear });
+      const res = await fetch(`${API_BASE_URL}/consistency?${params.toString()}`, { headers });
+      if (!res.ok) return [fieldName, null];
+      const data = await res.json();
+      return [fieldName, data];
+    })
+  );
+
+  const out = {};
+  for (const r of results) {
+    if (r.status === "fulfilled" && r.value[1]) {
+      const [field, data] = r.value;
+      out[field] = data;
+    }
+  }
+  return out;
 }
 
 const STATUS = {
@@ -1085,6 +1141,24 @@ function getCellPage(cellData) {
   return cellData.source_page || 0;
 }
 
+function getCellConfidence(cellData) {
+  if (cellData == null || typeof cellData === "string") return null;
+  return cellData.confidence || null;
+}
+
+function getMgmtConfidence(cellData) {
+  if (cellData == null || typeof cellData === "string") return null;
+  const score = cellData.mgmt_confidence;
+  if (score == null || score === 0) return null;
+  return { score, reason: cellData.mgmt_confidence_reason || "" };
+}
+
+function mgmtConfidenceColor(score) {
+  if (score >= 8) return "#1F7A4D";
+  if (score >= 5) return "#B45309";
+  return "#9B3E3E";
+}
+
 // --- HELPER COMPONENT FOR INTERACTIVE MASK HIGHLIGHTING ---
 function TourDomHighlighter({ targetId }) {
   useEffect(() => {
@@ -1106,6 +1180,22 @@ function TourDomHighlighter({ targetId }) {
 export default function ConcallTool() {
   const [theme, setTheme] = useState("light");
   const t = THEMES[theme];
+
+  // --- AUTH STATE ---
+  const [session, setSession] = useState(undefined); // undefined = loading, null = signed out
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session ?? null));
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, s) => setSession(s));
+    return () => subscription.unsubscribe();
+  }, []);
+  const sessionRef = useRef(session);
+  sessionRef.current = session;
+
+  const handleSignOut = async () => {
+    await supabase.auth.signOut();
+    setRows([]);
+    setFiles([]);
+  };
 
   const [columns, setColumns] = useState(DEFAULT_COLUMNS);
   const [editingColumns, setEditingColumns] = useState(false);
@@ -1199,11 +1289,14 @@ export default function ConcallTool() {
       prev.map((f) => (f.id === entry.id ? { ...f, status: STATUS.EXTRACTING } : f))
     );
     try {
-      const rowData = await extractViaBackend(entry.file, columnsRef.current);
+      const rowData = await extractViaBackend(entry.file, columnsRef.current, sessionRef.current);
+      const consistency = sessionRef.current
+        ? await fetchConsistencyForRow(rowData, columnsRef.current, sessionRef.current).catch(() => ({}))
+        : {};
       const rowId = ++idCounter.current;
       setRows((prev) => [
         ...prev,
-        { id: rowId, fileName: entry.name, data: rowData, mintedAt: Date.now() },
+        { id: rowId, fileName: entry.name, data: rowData, consistency, mintedAt: Date.now() },
       ]);
       setFiles((prev) =>
         prev.map((f) => (f.id === entry.id ? { ...f, status: STATUS.DONE } : f))
@@ -1302,7 +1395,7 @@ export default function ConcallTool() {
   const exportPDF = () => {
     const doc = new jsPDF({ orientation: "landscape", unit: "pt", format: "a4" });
     doc.setFontSize(14);
-    doc.text("Concall Insight Extractor — Ledger", 32, 28);
+    doc.text("Concalls.in — Management Guidance Tracker", 32, 28);
     autoTable(doc, {
       startY: 42,
       head: [columns],
@@ -1352,6 +1445,9 @@ export default function ConcallTool() {
   ).length;
 
   const NON_CITABLE_FIELDS = ["Quarter and Year", "Company Name"];
+
+  // Still initialising — show nothing to avoid flash
+  if (session === undefined) return null;
 
   return (
     <div
@@ -1515,7 +1611,7 @@ export default function ConcallTool() {
               className="display"
               style={{ fontSize: "22px", fontWeight: 600, letterSpacing: "-0.01em" }}
             >
-              Ledger
+              Concalls.in
             </span>
             <span
               className="mono"
@@ -1526,7 +1622,7 @@ export default function ConcallTool() {
                 textTransform: "uppercase",
               }}
             >
-              Concall Insight Extractor
+              Management Guidance Tracker
             </span>
           </div>
 
@@ -1583,6 +1679,47 @@ export default function ConcallTool() {
                 {theme === "light" ? "Light" : "Dark"}
               </span>
             </button>
+
+            {/* Auth area */}
+            {session ? (
+              <div style={{ display: "flex", alignItems: "center", gap: "8px", marginLeft: "4px" }}>
+                {session.user?.user_metadata?.avatar_url ? (
+                  <img
+                    src={session.user.user_metadata.avatar_url}
+                    alt="avatar"
+                    style={{ width: "28px", height: "28px", borderRadius: "50%", border: "1.5px solid rgba(255,255,255,0.2)" }}
+                  />
+                ) : (
+                  <div style={{ width: "28px", height: "28px", borderRadius: "50%", background: "rgba(255,255,255,0.15)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "12px", color: t.headerInk }}>
+                    {(session.user?.email || session.user?.user_metadata?.name || "?")[0].toUpperCase()}
+                  </div>
+                )}
+                <button
+                  onClick={handleSignOut}
+                  style={{ background: "transparent", border: "none", color: "rgba(255,255,255,0.55)", fontSize: "12px", cursor: "pointer", padding: "0" }}
+                >
+                  Sign out
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => supabase.auth.signInWithOAuth({ provider: "google", options: { redirectTo: window.location.origin } })}
+                style={{
+                  background: "rgba(255,255,255,0.1)",
+                  border: "1px solid rgba(255,255,255,0.2)",
+                  borderRadius: "20px",
+                  padding: "5px 14px",
+                  color: t.headerInk,
+                  fontSize: "12px",
+                  fontWeight: 500,
+                  cursor: "pointer",
+                  marginLeft: "4px",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                Save progress →
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -1947,6 +2084,16 @@ export default function ConcallTool() {
                           const isTakeaway = c.toLowerCase().includes("takeaway");
                           const isRisk = c.toLowerCase().includes("risk");
                           const cellValue = getCellValue(r.data[c]);
+                          const isImplied = cellValue.startsWith("Implied:");
+                          const isNoGuidance = cellValue === "No explicit guidance";
+                          const exclusionNote = (!isImplied && typeof r.data[c] === "object") ? (r.data[c]?.exclusion_note || "") : "";
+                          const rawConsistency = c !== "Company Name" ? r.consistency?.[c] : null;
+                          const consistencyIsNew = rawConsistency?.status === "NEW";
+                          const consistencyData = (rawConsistency && !consistencyIsNew) ? rawConsistency : null;
+                          const consistencyDisplay = consistencyData ? CONSISTENCY_DISPLAY[consistencyData.status] : null;
+                          const currentQuarter = getCellValue(r.data["Quarter and Year"]);
+                          const prevQuarter = previousAdjacentQuarter(currentQuarter);
+                          const mgmtConf = c !== "Company Name" && c !== "Quarter and Year" ? getMgmtConfidence(r.data[c]) : null;
                           return (
                             <td
                               key={c}
@@ -1956,15 +2103,29 @@ export default function ConcallTool() {
                                 maxWidth: "260px",
                                 fontWeight: c === "Company Name" ? 600 : 400,
                                 color:
-                                  isRisk && cellValue && cellValue !== "No explicit guidance"
+                                  isRisk && cellValue && !isNoGuidance
                                     ? t.rust
                                     : t.ink,
                               }}
                             >
-                              {cellValue ? (
+                              {isNoGuidance ? (
+                                <span
+                                  title={exclusionNote || undefined}
+                                  style={{
+                                    color: t.inkFaint,
+                                    cursor: exclusionNote ? "help" : "default",
+                                    borderBottom: exclusionNote ? `1px dashed ${t.inkFaint}` : "none",
+                                  }}
+                                >
+                                  No explicit guidance
+                                </span>
+                              ) : cellValue ? (
                                 <span
                                   className={isTakeaway ? "takeaway-mark" : ""}
-                                  style={isTakeaway ? { "--mark-color": t.accentBg } : undefined}
+                                  style={{
+                                    ...(isTakeaway ? { "--mark-color": t.accentBg } : {}),
+                                    ...(isImplied ? { color: t.inkMuted, fontStyle: "italic" } : {}),
+                                  }}
                                 >
                                   {cellValue}
                                 </span>
@@ -1972,6 +2133,58 @@ export default function ConcallTool() {
                                 <span style={{ color: t.inkFaint }} className="mono">
                                   —
                                 </span>
+                              )}
+                              {session && consistencyIsNew && prevQuarter && c !== "Company Name" && c !== "Quarter and Year" && cellValue && cellValue !== "No explicit guidance" && (
+                                <div style={{ marginTop: "5px" }}>
+                                  <span
+                                    title={`Upload the ${prevQuarter} report to enable quarter-on-quarter comparison for this field`}
+                                    style={{
+                                      fontSize: "10px",
+                                      color: t.inkFaint,
+                                      borderBottom: `1px dashed ${t.inkFaint}`,
+                                      cursor: "help",
+                                    }}
+                                  >
+                                    + Add {prevQuarter} report to compare
+                                  </span>
+                                </div>
+                              )}
+                              {(consistencyDisplay || mgmtConf) && (
+                                <div style={{ marginTop: "5px", display: "flex", gap: "4px", flexWrap: "wrap" }}>
+                                  {consistencyDisplay && (
+                                    <span
+                                      title={consistencyData.note}
+                                      style={{
+                                        fontSize: "10px",
+                                        fontWeight: 600,
+                                        color: consistencyDisplay.color,
+                                        background: consistencyDisplay.color + "18",
+                                        borderRadius: "3px",
+                                        padding: "1px 5px",
+                                        letterSpacing: "0.02em",
+                                        cursor: "default",
+                                      }}
+                                    >
+                                      {consistencyDisplay.label}
+                                    </span>
+                                  )}
+                                  {mgmtConf && (
+                                    <span
+                                      title={mgmtConf.reason}
+                                      style={{
+                                        fontSize: "10px",
+                                        fontWeight: 700,
+                                        color: mgmtConfidenceColor(mgmtConf.score),
+                                        background: mgmtConfidenceColor(mgmtConf.score) + "18",
+                                        borderRadius: "3px",
+                                        padding: "1px 5px",
+                                        cursor: "default",
+                                      }}
+                                    >
+                                      {mgmtConf.score}/10
+                                    </span>
+                                  )}
+                                </div>
                               )}
                             </td>
                           );
@@ -2037,6 +2250,9 @@ export default function ConcallTool() {
                               {citableColumns.map((c) => {
                                 const quote = getCellSource(r.data[c]);
                                 const page = getCellPage(r.data[c]);
+                                const conf = getCellConfidence(r.data[c]);
+                                const confDisplay = conf ? CONFIDENCE_DISPLAY[conf] : null;
+                                const mgmtC = getMgmtConfidence(r.data[c]);
                                 if (!quote) return null;
                                 return (
                                   <div key={c} style={{ fontSize: "12px", lineHeight: "1.45" }}>
@@ -2045,6 +2261,39 @@ export default function ConcallTool() {
                                     {page > 0 && (
                                       <span className="mono" style={{ fontSize: "10px", color: t.inkFaint, marginLeft: "6px", background: t.bgSubtle, padding: "2px 5px", borderRadius: "3px" }}>
                                         p. {page}
+                                      </span>
+                                    )}
+                                    {confDisplay && (
+                                      <span
+                                        title="Quote verification confidence"
+                                        style={{
+                                          fontSize: "10px",
+                                          fontWeight: 700,
+                                          color: confDisplay.color,
+                                          background: confDisplay.color + "18",
+                                          borderRadius: "3px",
+                                          padding: "1px 5px",
+                                          marginLeft: "6px",
+                                          letterSpacing: "0.04em",
+                                        }}
+                                      >
+                                        {confDisplay.label}
+                                      </span>
+                                    )}
+                                    {mgmtC && (
+                                      <span
+                                        title={mgmtC.reason}
+                                        style={{
+                                          fontSize: "10px",
+                                          fontWeight: 700,
+                                          color: mgmtConfidenceColor(mgmtC.score),
+                                          background: mgmtConfidenceColor(mgmtC.score) + "18",
+                                          borderRadius: "3px",
+                                          padding: "1px 5px",
+                                          marginLeft: "6px",
+                                        }}
+                                      >
+                                        mgmt {mgmtC.score}/10
                                       </span>
                                     )}
                                   </div>
@@ -2061,7 +2310,56 @@ export default function ConcallTool() {
             </table>
           </div>
         ) : null}
+
+        {/* Consistency feature teaser — shown to guests after first extraction */}
+        {!session && rows.length > 0 && (
+          <div
+            style={{
+              marginTop: "24px",
+              padding: "16px 20px",
+              background: t.panel,
+              border: `1px solid ${t.hairline}`,
+              borderLeft: `3px solid ${t.accent}`,
+              borderRadius: "8px",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "16px",
+              flexWrap: "wrap",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "flex-start", gap: "12px" }}>
+              <span style={{ fontSize: "18px", lineHeight: 1 }}>🔒</span>
+              <div>
+                <div style={{ fontSize: "13px", fontWeight: 600, color: t.ink, marginBottom: "3px" }}>
+                  Unlock consistency tracking
+                </div>
+                <div style={{ fontSize: "12px", color: t.inkMuted, lineHeight: 1.5 }}>
+                  Sign in to see what management changed, maintained, or dropped compared to last quarter — automatically tracked across every report you upload.
+                </div>
+              </div>
+            </div>
+            <button
+              onClick={() => supabase.auth.signInWithOAuth({ provider: "google", options: { redirectTo: window.location.origin } })}
+              style={{
+                flexShrink: 0,
+                background: t.accent,
+                color: "#fff",
+                border: "none",
+                borderRadius: "6px",
+                padding: "8px 16px",
+                fontSize: "12px",
+                fontWeight: 600,
+                cursor: "pointer",
+                whiteSpace: "nowrap",
+              }}
+            >
+              Sign in with Google →
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
 }
+

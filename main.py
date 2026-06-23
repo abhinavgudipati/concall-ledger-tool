@@ -11,11 +11,14 @@ import io
 import json
 import logging
 import os
+import re
 import time
 
+import jwt as pyjwt
+from jwt import PyJWKClient
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -41,6 +44,188 @@ if not GEMINI_API_KEY:
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 MODEL_NAME = "gemini-3.1-flash-lite"
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    logger.warning(
+        "DATABASE_URL is not set. Consistency scoring and extraction history "
+        "will be disabled — extraction itself will still work normally."
+    )
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://iqlzvhqumjcfbulgjgqb.supabase.co")
+_jwks_url = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
+_jwks_client = PyJWKClient(_jwks_url, cache_keys=True)
+logger.info(f"JWKS client initialised: {_jwks_url}")
+
+
+def get_current_user(authorization: str = Header(None)) -> str | None:
+    """
+    Verifies the Supabase JWT using their public JWKS endpoint (supports
+    ES256 and RS256). Returns the user UUID, or None for guest requests.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        return None  # guest — allowed, extractions work but aren't saved per-user
+    token = authorization.split(" ", 1)[1]
+    try:
+        signing_key = _jwks_client.get_signing_key_from_jwt(token)
+        payload = pyjwt.decode(
+            token,
+            signing_key,
+            algorithms=["ES256", "RS256", "HS256"],
+            options={"verify_aud": False},
+        )
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Token has no subject claim.")
+        return user_id
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired. Please sign in again.")
+    except pyjwt.InvalidTokenError as e:
+        logger.error(f"JWT verification failed: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+
+
+def get_db_connection():
+    """
+    Opens a new connection per call rather than holding one open long-term.
+    At this app's current scale this is simpler and safer than managing a
+    persistent pool ourselves — Supabase's own pooler (note port 6543 in
+    DATABASE_URL) already handles connection reuse on its end.
+    """
+    import psycopg2
+    return psycopg2.connect(DATABASE_URL)
+
+
+def save_extraction(company_name: str, quarter_year: str, filename: str, row: dict, user_id: str | None = None) -> None:
+    """
+    Persists one row per extracted field. Failures here are logged but never
+    raised — a database hiccup should not break the actual extraction
+    response the user is waiting on.
+    """
+    if not DATABASE_URL:
+        return
+
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        for field_name, field_data in row.items():
+            if field_name == "Quarter and Year":
+                continue
+            value = field_data.get("value", "") if isinstance(field_data, dict) else str(field_data)
+            source_quote = field_data.get("source_quote", "") if isinstance(field_data, dict) else ""
+            confidence = field_data.get("confidence", "") if isinstance(field_data, dict) else ""
+            cur.execute(
+                """
+                INSERT INTO extractions
+                    (company_name, quarter_year, field_name, value, source_quote, confidence, filename, user_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (company_name, quarter_year, field_name, user_id)
+                DO UPDATE SET
+                    value        = EXCLUDED.value,
+                    source_quote = EXCLUDED.source_quote,
+                    confidence   = EXCLUDED.confidence,
+                    filename     = EXCLUDED.filename,
+                    extracted_at = now()
+                WHERE extractions.company_name  = EXCLUDED.company_name
+                  AND extractions.quarter_year  = EXCLUDED.quarter_year
+                  AND extractions.field_name    = EXCLUDED.field_name
+                  AND extractions.user_id       = EXCLUDED.user_id
+                """,
+                (company_name, quarter_year, field_name, value, source_quote, confidence, filename, user_id),
+            )
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info(f"Saved extraction history for '{company_name}' {quarter_year}")
+    except Exception:
+        logger.exception(f"Failed to save extraction history for '{company_name}' {quarter_year}")
+
+
+def previous_adjacent_quarter(quarter_year: str) -> str | None:
+    """
+    Returns the immediately preceding quarter in "Q<N>-<YYYY>" format.
+    Q2-2026 → Q1-2026, Q1-2026 → Q4-2025. Returns None if unparseable.
+    """
+    import re as _re
+    m = _re.match(r"Q([1-4])-(\d{4})$", quarter_year.strip())
+    if not m:
+        return None
+    n, year = int(m.group(1)), int(m.group(2))
+    if n == 1:
+        return f"Q4-{year - 1}"
+    return f"Q{n - 1}-{year}"
+
+
+def get_adjacent_quarter_value(company_name: str, adjacent_quarter_year: str, field_name: str, user_id: str | None = None) -> dict | None:
+    """
+    Fetches the stored value for a specific company + quarter + field, scoped
+    to the requesting user. Returns None if not found or DB unavailable.
+    """
+    if not DATABASE_URL:
+        return None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT quarter_year, value, extracted_at
+            FROM extractions
+            WHERE company_name = %s
+              AND field_name = %s
+              AND quarter_year = %s
+              AND (user_id = %s OR (%s IS NULL AND user_id IS NULL))
+            LIMIT 1
+            """,
+            (company_name, field_name, adjacent_quarter_year, user_id, user_id),
+        )
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not row:
+            return None
+        return {"quarter_year": row[0], "value": row[1], "extracted_at": row[2].isoformat()}
+    except Exception:
+        logger.exception(f"Failed to fetch adjacent quarter for '{company_name}' / '{field_name}' / '{adjacent_quarter_year}'")
+        return None
+
+
+def get_prior_quarter_values(company_name: str, exclude_quarter_year: str, field_name: str, limit: int = 3, user_id: str | None = None) -> list[dict]:
+    """
+    Fetches the most recent prior extractions of one field for a company,
+    excluding the quarter currently being processed (in case of re-runs).
+    Returns most-recent-first. Returns [] on any failure or if DB is unset —
+    callers should treat that as "no history available" rather than an error.
+    """
+    if not DATABASE_URL:
+        return []
+
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT quarter_year, value, extracted_at
+            FROM extractions
+            WHERE company_name = %s
+              AND field_name = %s
+              AND quarter_year != %s
+              AND (user_id = %s OR (%s IS NULL AND user_id IS NULL))
+            ORDER BY extracted_at DESC
+            LIMIT %s
+            """,
+            (company_name, field_name, exclude_quarter_year, user_id, user_id, limit),
+        )
+        results = [
+            {"quarter_year": r[0], "value": r[1], "extracted_at": r[2].isoformat()}
+            for r in cur.fetchall()
+        ]
+        cur.close()
+        conn.close()
+        return results
+    except Exception:
+        logger.exception(f"Failed to fetch prior quarters for '{company_name}' / '{field_name}'")
+        return []
+
 
 app = FastAPI(title="Concall Insight Extractor API")
 
@@ -173,19 +358,25 @@ def build_prompt(columns: list[str], transcript_text: str) -> str:
     citation_field_list = ", ".join(f'"{c}"' for c in citation_fields)
     return f"""You are analyzing a company earnings conference call transcript. Extract management's forward-looking guidance and commentary with precision.
 
-EXTRACT THE FOLLOWING (only if explicitly stated by management — do not infer or estimate):
+EXTRACT THE FOLLOWING:
 {numbered_fields}
+
+GUIDANCE TIERS — use exactly one of these value formats per field:
+1. EXPLICIT: Management made a direct, forward-looking commitment for a named period. Write the value in management's own words (under 20 words). Example: "18-20% revenue growth in FY27"
+2. IMPLIED: Management gave a strong directional signal without a hard commitment — e.g. "comfortable with consensus", "broadly similar to last year", "expect improvement". Prefix the value with "Implied: " and summarise in under 15 words. Example: "Implied: margins expected to improve, no specific target given"
+3. NONE: No guidance or signal of any kind on this topic. Write "No explicit guidance".
 
 RULES:
 - "Quarter and Year" must be normalized to the exact format "Q<N>-<YYYY>" (e.g. "Q1-2026", "Q4-2026"), using the fiscal quarter and fiscal year stated in the transcript (e.g. "Q4FY26 Earnings Conference Call" becomes "Q4-2026"; "Q3 FY '26" becomes "Q3-2026"). If the transcript states a calendar period instead of a fiscal quarter (e.g. "quarter ended March 31, 2026"), infer the correct fiscal quarter label only if the fiscal year convention is unambiguous from context; otherwise write "Unclear from transcript".
-- Use management's own framing (e.g. "Management expects 80% revenue growth in FY27" not "the company will grow")
-- If a range is given, keep the range (e.g. "20-25%")
-- Only count a statement as guidance if it is a forward-looking commitment for an upcoming, named period (e.g. "FY27", "next quarter", "next 18 months"). Exclude standing long-term policies, philosophies, or historical ratios that are not framed as a new commitment for the period ahead — for example, "we target 1.5x to 2x nominal GDP growth" is a standing policy, not FY27 guidance, unless management explicitly reaffirms it as the target for the specific period in question.
-- Mechanical or one-off effects (e.g. day-count quirks, base-effect comparisons, calendar timing) are not strategic guidance, even if management quantifies their short-term impact. Only extract genuine strategic targets.
-- If no explicit guidance was given on a category for the relevant period, write "No explicit guidance"
-- Do not add your own forecast or opinion
-- Keep each value under 20 words
-- "Company Name" should be the actual company name found in the transcript
+- Use management's own framing wherever possible.
+- If a range is given, keep the range (e.g. "20-25%").
+- Standing long-term policies not reaffirmed for a specific upcoming period should be treated as IMPLIED at most, not EXPLICIT.
+- Mechanical or one-off effects (e.g. day-count quirks, base-effect comparisons) are not guidance — use NONE.
+- Do not add your own forecast or opinion.
+- "Company Name" should be the actual company name found in the transcript.
+
+EXCLUSION NOTE — for each of these fields: {citation_field_list}
+- Also provide an "exclusion_note": if value is "No explicit guidance", write a brief phrase (under 12 words) explaining what, if anything, management said about this topic and why it did not qualify — e.g. "Referenced GDP-linked target but not for a named period" or "Topic not discussed". If guidance was found (explicit or implied), set exclusion_note to "".
 
 PAGE MARKERS:
 - The transcript below contains markers like "[[PAGE 4]]" inserted at the start of each page. These markers are NOT part of the actual transcript content — never quote them or include them in any value or source_quote.
@@ -197,6 +388,17 @@ CITATIONS — for each of these fields: {citation_field_list}
 - If the value is "No explicit guidance", set source_quote to an empty string "" and source_page to 0.
 - For "Key Takeaway" (a synthesized summary, not a direct quote), source_quote should be the single most representative verbatim sentence from the transcript that best supports the takeaway, and source_page its page number.
 - Never invent or paraphrase a quote — if you cannot find an exact supporting sentence, set source_quote to "" and source_page to 0.
+
+MANAGEMENT CONFIDENCE SCORE — for each of these fields: {citation_field_list}
+- Also provide a "mgmt_confidence" integer from 1 to 10 reflecting how strongly management expressed conviction in this guidance, based solely on language, tone, and specificity in the transcript.
+- Also provide a "mgmt_confidence_reason": a short phrase (under 10 words) explaining the score.
+- Scoring rubric:
+  9-10: Firm commitment, specific number or range, no hedges, possibly repeated
+  7-8:  Specific but with minor qualifiers or a broad range
+  5-6:  General direction given, meaningful hedges or uncertainty present
+  3-4:  Tentative, heavily conditional, or dependent on external factors
+  1-2:  Speculative, "hope to", aspirational, or no real commitment
+- If value is "No explicit guidance", set mgmt_confidence to 0 and mgmt_confidence_reason to "".
 
 TRANSCRIPT:
 {transcript_text[:MAX_TRANSCRIPT_CHARS]}"""
@@ -217,8 +419,11 @@ def call_gemini(prompt: str, columns: list[str]) -> dict:
                     "value": {"type": "string"},
                     "source_quote": {"type": "string"},
                     "source_page": {"type": "integer"},
+                    "mgmt_confidence": {"type": "integer"},
+                    "mgmt_confidence_reason": {"type": "string"},
+                    "exclusion_note": {"type": "string"},
                 },
-                "required": ["value", "source_quote", "source_page"],
+                "required": ["value", "source_quote", "source_page", "mgmt_confidence", "mgmt_confidence_reason", "exclusion_note"],
             }
 
     response_schema = {
@@ -236,6 +441,7 @@ def call_gemini(prompt: str, columns: list[str]) -> dict:
             config=genai_types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=response_schema,
+                temperature=0.0,
             ),
         )
         elapsed = time.monotonic() - start
@@ -258,6 +464,109 @@ def call_gemini(prompt: str, columns: list[str]) -> dict:
     return row
 
 
+def classify_consistency(current_value: str, prior_value: str | None) -> str:
+    """
+    Compares this quarter's value against the most recent prior quarter's
+    value for the same field. Returns one of:
+      NEW        - no prior value exists at all
+      REAFFIRMED - same guidance, essentially unchanged (including when
+                   both quarters explicitly gave no guidance)
+      CHANGED    - both quarters gave guidance, but it differs
+      DROPPED    - prior quarter gave guidance, this quarter does not
+      RESUMED    - prior quarter gave none, this quarter newly does
+    """
+    if prior_value is None:
+        return "NEW"
+
+    current_is_none = current_value == "No explicit guidance"
+    prior_is_none = prior_value == "No explicit guidance"
+
+    if current_is_none and prior_is_none:
+        return "REAFFIRMED"
+    if current_is_none and not prior_is_none:
+        return "DROPPED"
+    if not current_is_none and prior_is_none:
+        return "RESUMED"
+
+    def normalize(s: str) -> str:
+        s = s.lower()
+        s = re.sub(r"[^a-z0-9.%\s]", "", s)
+        return re.sub(r"\s+", " ", s).strip()
+
+    norm_current = normalize(current_value)
+    norm_prior = normalize(prior_value)
+
+    if norm_current == norm_prior:
+        return "REAFFIRMED"
+
+    def extract_numbers(s: str) -> list[str]:
+        return re.findall(r"\d+\.?\d*%?", s)
+
+    current_numbers = extract_numbers(norm_current)
+    prior_numbers = extract_numbers(norm_prior)
+
+    if current_numbers and current_numbers == prior_numbers:
+        return "REAFFIRMED"
+
+    return "CHANGED"
+
+
+def build_consistency_note(status: str, current_value: str, prior_value: str | None, prior_quarter: str | None) -> str:
+    """A short, human-readable one-liner explaining the consistency label."""
+    if status == "NEW":
+        return "No prior quarter on record for this field."
+    if status == "REAFFIRMED":
+        return f"Consistent with {prior_quarter}: \"{prior_value}\""
+    if status == "DROPPED":
+        return f"{prior_quarter} gave guidance (\"{prior_value}\"); this quarter does not."
+    if status == "RESUMED":
+        return f"{prior_quarter} gave no guidance; this quarter newly provides it."
+    if status == "CHANGED":
+        return f"{prior_quarter} said: \"{prior_value}\""
+    return ""
+
+
+def compute_confidence(value: str, source_quote: str, transcript_text: str) -> str:
+    """
+    Confidence is derived from whether the model's source_quote can actually
+    be found in the real transcript text — it is NOT the model's own
+    self-reported certainty (LLMs are unreliable at rating their own
+    accuracy, and will confidently "rate" a fabricated answer highly).
+
+    HIGH:   source_quote appears verbatim (normalized for whitespace/case)
+            in the transcript.
+    MEDIUM: most significant words of the quote appear in the transcript,
+            suggesting a real but paraphrased reference.
+    LOW:    the quote does not meaningfully match the transcript at all.
+    N/A:    no guidance was given for this field.
+    """
+    if not source_quote or value == "No explicit guidance":
+        return "N/A"
+
+    def normalize(s: str) -> str:
+        s = re.sub(r"\[\[PAGE \d+\]\]", " ", s)
+        return re.sub(r"\s+", " ", s.strip().lower())
+
+    norm_quote = normalize(source_quote)
+    norm_transcript = normalize(transcript_text)
+
+    if norm_quote in norm_transcript:
+        return "HIGH"
+
+    quote_words = norm_quote.split()
+    if len(quote_words) < 4:
+        return "LOW"
+
+    significant_words = [w for w in quote_words if len(w) > 3]
+    if not significant_words:
+        return "LOW"
+
+    matches = sum(1 for w in significant_words if w in norm_transcript)
+    overlap_ratio = matches / len(significant_words)
+
+    return "MEDIUM" if overlap_ratio >= 0.8 else "LOW"
+
+
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
@@ -271,7 +580,7 @@ def _resolve_columns(columns: str | None) -> list[str]:
     return DEFAULT_COLUMNS
 
 
-def _extract_one(filename: str, file_bytes: bytes, active_columns: list[str]) -> dict:
+def _extract_one(filename: str, file_bytes: bytes, active_columns: list[str], user_id: str | None = None) -> dict:
     """Shared logic for a single file. Raises HTTPException on failure."""
     logger.info(f"=== Starting extraction for '{filename}' ===")
 
@@ -297,6 +606,25 @@ def _extract_one(filename: str, file_bytes: bytes, active_columns: list[str]) ->
         logger.error(f"Extraction failed for '{filename}': {type(e).__name__}: {e}")
         raise HTTPException(status_code=502, detail=f"Extraction failed: {e}")
 
+    # Augment each citable field with a derived confidence score, computed
+    # by checking the model's source_quote against the real transcript text
+    # — not by asking the model to self-rate, which is unreliable.
+    for field_name, field_data in row.items():
+        if isinstance(field_data, dict) and "value" in field_data:
+            field_data["confidence"] = compute_confidence(
+                field_data.get("value", ""),
+                field_data.get("source_quote", ""),
+                text,
+            )
+
+    # Persist this extraction for future consistency comparisons. Failures
+    # here are logged but never block the response — history is a bonus,
+    # not a dependency of the core extraction feature.
+    company_name = row.get("Company Name", {}).get("value", "") if isinstance(row.get("Company Name"), dict) else ""
+    quarter_year = row.get("Quarter and Year", "") if isinstance(row.get("Quarter and Year"), str) else ""
+    if company_name and quarter_year:
+        save_extraction(company_name, quarter_year, filename, row, user_id=user_id)
+
     logger.info(f"=== Finished extraction for '{filename}' successfully ===")
     return row
 
@@ -304,15 +632,12 @@ def _extract_one(filename: str, file_bytes: bytes, active_columns: list[str]) ->
 @app.post("/extract", response_model=ExtractResponse)
 async def extract_transcript(
     file: UploadFile = File(...),
-    columns: str = None,  # comma-separated string, optional override
+    columns: str = None,
+    user_id: str | None = Depends(get_current_user),
 ):
     active_columns = _resolve_columns(columns)
     file_bytes = await file.read()
-    # _extract_one makes a blocking (synchronous) call to the Gemini SDK.
-    # Running it via run_in_threadpool keeps the event loop free to respond
-    # to health checks and other requests while this one is in flight —
-    # without this, a slow model call can stall the whole server.
-    row = await run_in_threadpool(_extract_one, file.filename, file_bytes, active_columns)
+    row = await run_in_threadpool(_extract_one, file.filename, file_bytes, active_columns, user_id)
     return ExtractResponse(filename=file.filename, row=row)
 
 
@@ -322,15 +647,10 @@ class UrlExtractRequest(BaseModel):
 
 
 @app.post("/extract-from-url", response_model=ExtractResponse)
-async def extract_transcript_from_url(payload: UrlExtractRequest):
-    """
-    Accepts a direct link to a PDF (e.g. a BSE/NSE filing URL) instead of an
-    uploaded file. Downloads the PDF server-side, then runs the same
-    extraction logic as /extract.
-
-    Note: some exchange/IR sites apply bot detection to non-browser requests.
-    This is not guaranteed to work on every source.
-    """
+async def extract_transcript_from_url(
+    payload: UrlExtractRequest,
+    user_id: str | None = Depends(get_current_user),
+):
     if not payload.url.strip():
         raise HTTPException(status_code=400, detail="No URL provided.")
 
@@ -341,9 +661,8 @@ async def extract_transcript_from_url(payload: UrlExtractRequest):
     except ValueError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
-    # Use the URL's last path segment as a stand-in filename for logging/display.
     filename = payload.url.rstrip("/").split("/")[-1] or "downloaded.pdf"
-    row = await run_in_threadpool(_extract_one, filename, file_bytes, active_columns)
+    row = await run_in_threadpool(_extract_one, filename, file_bytes, active_columns, user_id)
     return ExtractResponse(filename=filename, row=row)
 
 
@@ -362,6 +681,7 @@ class BatchExtractResponse(BaseModel):
 async def extract_transcripts_batch(
     files: list[UploadFile] = File(...),
     columns: str = None,
+    user_id: str | None = Depends(get_current_user),
 ):
     """
     Accepts multiple PDFs in one request and processes them sequentially.
@@ -374,7 +694,7 @@ async def extract_transcripts_batch(
     for f in files:
         file_bytes = await f.read()
         try:
-            row = await run_in_threadpool(_extract_one, f.filename, file_bytes, active_columns)
+            row = await run_in_threadpool(_extract_one, f.filename, file_bytes, active_columns, user_id)
             results.append(BatchRowResult(filename=f.filename, ok=True, row=row))
         except HTTPException as e:
             results.append(BatchRowResult(filename=f.filename, ok=False, error=str(e.detail)))
@@ -382,3 +702,52 @@ async def extract_transcripts_batch(
             results.append(BatchRowResult(filename=f.filename, ok=False, error=str(e)))
 
     return BatchExtractResponse(results=results)
+
+
+class PriorQuartersResponse(BaseModel):
+    company_name: str
+    field_name: str
+    history: list[dict]
+
+
+@app.get("/history", response_model=PriorQuartersResponse)
+def get_history(
+    company_name: str,
+    field_name: str,
+    exclude_quarter_year: str = "",
+    limit: int = 3,
+    user_id: str | None = Depends(get_current_user),
+):
+    history = get_prior_quarter_values(company_name, exclude_quarter_year, field_name, limit, user_id=user_id)
+    return PriorQuartersResponse(company_name=company_name, field_name=field_name, history=history)
+
+
+class ConsistencyResponse(BaseModel):
+    status: str  # NEW | REAFFIRMED | CHANGED | DROPPED | RESUMED
+    note: str
+    prior_quarter: str | None = None
+    prior_value: str | None = None
+
+
+@app.get("/consistency", response_model=ConsistencyResponse)
+def get_consistency(
+    company_name: str,
+    field_name: str,
+    current_value: str,
+    current_quarter_year: str = "",
+    user_id: str | None = Depends(get_current_user),
+):
+    adj_quarter = previous_adjacent_quarter(current_quarter_year)
+    prior = get_adjacent_quarter_value(company_name, adj_quarter, field_name, user_id=user_id) if adj_quarter else None
+
+    if not prior:
+        return ConsistencyResponse(status="NEW", note=build_consistency_note("NEW", current_value, None, None))
+
+    prior_quarter = prior["quarter_year"]
+    prior_value = prior["value"]
+    status = classify_consistency(current_value, prior_value)
+    note = build_consistency_note(status, current_value, prior_value, prior_quarter)
+
+    return ConsistencyResponse(
+        status=status, note=note, prior_quarter=prior_quarter, prior_value=prior_value
+    )
