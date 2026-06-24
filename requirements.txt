@@ -7,3 +7,4 @@ python-dotenv==1.1.1
 psycopg2-binary==2.9.12
 PyJWT==2.13.0
 requests
+razorpay==1.4.2

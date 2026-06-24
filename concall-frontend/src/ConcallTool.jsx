@@ -1061,7 +1061,9 @@ async function extractViaBackend(file, columns, session, forceRefresh = false) {
       const errBody = await response.json();
       if (errBody?.detail) detail = errBody.detail;
     } catch (_) {}
-    throw new Error(detail);
+    const err = new Error(detail);
+    if (response.status === 402) err.limitReached = true;
+    throw err;
   }
 
   const data = await response.json();
@@ -1200,7 +1202,88 @@ export default function ConcallTool() {
 
   // --- PAST REPORTS SIDEBAR ---
   const [pastReports, setPastReports] = useState([]);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(window.innerWidth >= 900);
+
+  // --- PRICING MODAL ---
+  const [pricingOpen, setPricingOpen] = useState(false);
+  const [checkoutLoading, setCheckoutLoading] = useState(null); // tier name being loaded
+
+  const handleUpgrade = async (tier) => {
+    if (!session) {
+      supabase.auth.signInWithOAuth({ provider: "google", options: { redirectTo: window.location.origin } });
+      return;
+    }
+    setCheckoutLoading(tier);
+    try {
+      const res = await fetch(`${API_BASE_URL}/create-order`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+        body: JSON.stringify({ tier }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Failed to create order");
+
+      const options = {
+        key: data.key_id,
+        amount: data.amount,
+        currency: data.currency,
+        name: "Concalls.in",
+        description: `${tier.charAt(0).toUpperCase() + tier.slice(1)} Plan`,
+        order_id: data.order_id,
+        prefill: { email: session.user?.email || "" },
+        theme: { color: "#1F4D3D" },
+        handler: () => {
+          setPricingOpen(false);
+          alert("Payment successful! Your plan will be upgraded in a few seconds.");
+        },
+      };
+      const rzp = new window.Razorpay(options);
+      rzp.open();
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setCheckoutLoading(null);
+    }
+  };
+
+  const PLANS = [
+    {
+      name: "Free",
+      price: { in: "₹0", intl: "$0" },
+      reports: "10 reports / month",
+      features: ["All 8 fields extracted", "Growth, Margin, Capex, Order Book", "Key Risk & Key Takeaway", "CSV / Excel / PDF export"],
+      cta: "Current plan",
+      ctaDisabled: true,
+      highlight: false,
+    },
+    {
+      name: "Growth",
+      price: { in: "₹199/mo", intl: "$2/mo" },
+      reports: "50 reports / month",
+      features: ["Everything in Free", "Consistency tracking across quarters", "Confidence scores per field", "Full extraction history"],
+      cta: "Upgrade to Growth",
+      ctaDisabled: false,
+      highlight: false,
+    },
+    {
+      name: "Pro",
+      price: { in: "₹499/mo", intl: "$5/mo" },
+      reports: "150 reports / month",
+      features: ["Everything in Growth", "Management confidence score (1–10)", "Implied guidance classification", "Exclusion notes & reasoning"],
+      cta: "Upgrade to Pro",
+      ctaDisabled: false,
+      highlight: true,
+    },
+    {
+      name: "Elite",
+      price: { in: "₹999/mo", intl: "$9/mo" },
+      reports: "Unlimited reports",
+      features: ["Everything in Pro", "Priority support", "Early access to new features", "Direct access to founder"],
+      cta: "Upgrade to Elite",
+      ctaDisabled: false,
+      highlight: false,
+    },
+  ];
 
   // --- GLOSSARY ---
   const [glossaryOpen, setGlossaryOpen] = useState(false);
@@ -1378,11 +1461,16 @@ export default function ConcallTool() {
         prev.map((f) => (f.id === entry.id ? { ...f, status: STATUS.DONE } : f))
       );
     } catch (err) {
-      setFiles((prev) =>
-        prev.map((f) =>
-          f.id === entry.id ? { ...f, status: STATUS.ERROR, error: err.message } : f
-        )
-      );
+      if (err.limitReached) {
+        setFiles((prev) => prev.map((f) => f.id === entry.id ? { ...f, status: STATUS.ERROR, error: "Monthly report limit reached." } : f));
+        setPricingOpen(true);
+      } else {
+        setFiles((prev) =>
+          prev.map((f) =>
+            f.id === entry.id ? { ...f, status: STATUS.ERROR, error: err.message } : f
+          )
+        );
+      }
     }
   }, []);
 
@@ -1762,6 +1850,16 @@ export default function ConcallTool() {
             {/* Auth area */}
             {session ? (
               <div style={{ display: "flex", alignItems: "center", gap: "8px", marginLeft: "4px" }}>
+                <button
+                  onClick={() => setPricingOpen(true)}
+                  style={{
+                    background: "#3FAE85", border: "none", borderRadius: "20px",
+                    padding: "5px 14px", fontSize: "11.5px", fontWeight: 700,
+                    color: "#fff", cursor: "pointer", letterSpacing: "0.02em",
+                  }}
+                >
+                  Upgrade ↑
+                </button>
                 {session.user?.user_metadata?.avatar_url ? (
                   <img
                     src={session.user.user_metadata.avatar_url}
@@ -1803,30 +1901,34 @@ export default function ConcallTool() {
         </div>
       </div>
 
-      <div style={{ display: "flex", maxWidth: "1800px", margin: "0 auto" }}>
+      <div style={{ display: "flex", maxWidth: "1800px", margin: "0 auto", alignItems: "flex-start" }}>
 
         {/* --- SIDEBAR --- */}
         {session && (
           <div className="sidebar" style={{
-            width: sidebarOpen ? "220px" : "40px",
-            minWidth: sidebarOpen ? "220px" : "40px",
-            borderRight: `1px solid ${t.hairline}`,
-            background: t.panel,
+            width: sidebarOpen ? "260px" : "48px",
+            minWidth: sidebarOpen ? "260px" : "48px",
+            borderRight: `1px solid ${t.hairlineStrong}`,
+            background: t.bgSubtle,
+            boxShadow: sidebarOpen ? "2px 0 12px rgba(0,0,0,0.06)" : "none",
             transition: "width 0.2s ease, min-width 0.2s ease",
             display: "flex",
             flexDirection: "column",
-            minHeight: "calc(100vh - 69px)",
+            height: "calc(100vh - 69px)",
+            position: "sticky",
+            top: "69px",
             overflow: "hidden",
+            flexShrink: 0,
           }}>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "16px 12px 10px", borderBottom: `1px solid ${t.hairline}` }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "18px 14px 14px", borderBottom: `1px solid ${t.hairlineStrong}` }}>
               {sidebarOpen && (
-                <span className="mono" style={{ fontSize: "10px", letterSpacing: "0.1em", color: t.inkFaint, fontWeight: 600 }}>
+                <span className="mono" style={{ fontSize: "10.5px", letterSpacing: "0.12em", color: t.ink, fontWeight: 700 }}>
                   PAST REPORTS
                 </span>
               )}
               <button
                 onClick={() => setSidebarOpen(o => !o)}
-                style={{ background: "none", border: "none", cursor: "pointer", color: t.inkFaint, fontSize: "14px", padding: "2px 4px", marginLeft: "auto" }}
+                style={{ background: "none", border: `1px solid ${t.hairline}`, borderRadius: "6px", cursor: "pointer", color: t.inkMuted, fontSize: "13px", padding: "3px 7px", marginLeft: "auto" }}
                 title={sidebarOpen ? "Collapse sidebar" : "Expand sidebar"}
               >
                 {sidebarOpen ? "◂" : "▸"}
@@ -1834,15 +1936,15 @@ export default function ConcallTool() {
             </div>
 
             {sidebarOpen && (
-              <div style={{ overflowY: "auto", flex: 1, padding: "8px 0" }}>
+              <div style={{ overflowY: "auto", flex: 1, padding: "12px 0" }}>
                 {Object.keys(reportsByCompany).length === 0 ? (
-                  <p style={{ fontSize: "11px", color: t.inkFaint, padding: "12px", lineHeight: 1.5 }}>
+                  <p style={{ fontSize: "12px", color: t.inkMuted, padding: "16px", lineHeight: 1.6 }}>
                     Your extracted reports will appear here.
                   </p>
                 ) : (
                   Object.entries(reportsByCompany).map(([company, reports]) => (
-                    <div key={company} style={{ marginBottom: "12px" }}>
-                      <div style={{ fontSize: "10.5px", fontWeight: 600, color: t.inkMuted, padding: "4px 12px 2px", letterSpacing: "0.02em" }}>
+                    <div key={company} style={{ marginBottom: "18px" }}>
+                      <div style={{ fontSize: "11.5px", fontWeight: 700, color: t.ink, padding: "4px 16px 6px", letterSpacing: "0.01em" }}>
                         {company}
                       </div>
                       {reports.map(r => (
@@ -1851,12 +1953,14 @@ export default function ConcallTool() {
                           onClick={() => loadPastReport(r.company_name, r.quarter_year)}
                           style={{
                             display: "block", width: "100%", textAlign: "left",
-                            padding: "5px 12px 5px 20px", background: "none", border: "none",
-                            cursor: "pointer", fontSize: "11.5px", color: t.inkMuted,
+                            padding: "7px 16px 7px 28px", background: "none", border: "none",
+                            cursor: "pointer", fontSize: "12.5px", color: t.inkMuted,
                             fontFamily: "'JetBrains Mono', monospace",
+                            borderLeft: `2px solid transparent`,
+                            transition: "background 0.1s, border-color 0.1s",
                           }}
-                          onMouseEnter={e => e.currentTarget.style.background = t.bgSubtle}
-                          onMouseLeave={e => e.currentTarget.style.background = "none"}
+                          onMouseEnter={e => { e.currentTarget.style.background = t.panel; e.currentTarget.style.borderLeftColor = t.accent; e.currentTarget.style.color = t.ink; }}
+                          onMouseLeave={e => { e.currentTarget.style.background = "none"; e.currentTarget.style.borderLeftColor = "transparent"; e.currentTarget.style.color = t.inkMuted; }}
                         >
                           {r.quarter_year}
                         </button>
@@ -2500,6 +2604,78 @@ export default function ConcallTool() {
         )}
         </div> {/* end main-content */}
       </div> {/* end sidebar+content flex */}
+
+      {/* Pricing modal */}
+      {pricingOpen && (
+        <div
+          onClick={() => setPricingOpen(false)}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: "24px" }}
+        >
+          <div
+            onClick={e => e.stopPropagation()}
+            style={{ background: t.panel, borderRadius: "16px", maxWidth: "860px", width: "100%", maxHeight: "90vh", overflowY: "auto", boxShadow: "0 24px 80px rgba(0,0,0,0.25)" }}
+          >
+            {/* Header */}
+            <div style={{ padding: "28px 32px 20px", borderBottom: `1px solid ${t.hairline}`, display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+              <div>
+                <div style={{ fontSize: "20px", fontWeight: 700, color: t.ink }}>Simple, transparent pricing</div>
+                <div style={{ fontSize: "13px", color: t.inkMuted, marginTop: "4px" }}>You've hit your free tier limit. Upgrade to keep going — cancel anytime.</div>
+              </div>
+              <button onClick={() => setPricingOpen(false)} style={{ background: "none", border: "none", color: t.inkFaint, cursor: "pointer", fontSize: "22px", padding: "0 4px", lineHeight: 1 }}>×</button>
+            </div>
+
+            {/* Plans grid */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "16px", padding: "24px 32px 32px" }}>
+              {PLANS.map(plan => (
+                <div
+                  key={plan.name}
+                  style={{
+                    border: plan.highlight ? `2px solid ${t.accent}` : `1px solid ${t.hairline}`,
+                    borderRadius: "12px",
+                    padding: "22px 20px",
+                    position: "relative",
+                    background: plan.highlight ? t.accentBg : t.bg,
+                    display: "flex", flexDirection: "column", gap: "12px",
+                  }}
+                >
+                  {plan.highlight && (
+                    <div style={{ position: "absolute", top: "-12px", left: "50%", transform: "translateX(-50%)", background: t.accent, color: "#fff", fontSize: "10px", fontWeight: 700, padding: "3px 10px", borderRadius: "20px", letterSpacing: "0.08em", whiteSpace: "nowrap" }}>
+                      MOST POPULAR
+                    </div>
+                  )}
+                  <div style={{ fontSize: "13px", fontWeight: 700, color: t.ink, letterSpacing: "0.04em" }}>{plan.name.toUpperCase()}</div>
+                  <div>
+                    <div style={{ fontSize: "22px", fontWeight: 700, color: t.ink }}>{plan.price.in}</div>
+                    <div style={{ fontSize: "11px", color: t.inkFaint }}>{plan.price.intl} international</div>
+                  </div>
+                  <div style={{ fontSize: "11.5px", color: t.accent, fontWeight: 600 }}>{plan.reports}</div>
+                  <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: "7px", flex: 1 }}>
+                    {plan.features.map(f => (
+                      <li key={f} style={{ fontSize: "12px", color: t.inkMuted, display: "flex", gap: "7px", alignItems: "flex-start" }}>
+                        <span style={{ color: t.accent, fontWeight: 700, flexShrink: 0 }}>✓</span> {f}
+                      </li>
+                    ))}
+                  </ul>
+                  <button
+                    disabled={plan.ctaDisabled || checkoutLoading === plan.name.toLowerCase()}
+                    onClick={() => { if (!plan.ctaDisabled) handleUpgrade(plan.name.toLowerCase()); }}
+                    style={{
+                      marginTop: "8px", width: "100%", padding: "10px", borderRadius: "8px", fontSize: "12.5px", fontWeight: 600,
+                      cursor: plan.ctaDisabled ? "default" : "pointer",
+                      background: plan.ctaDisabled ? t.bgSubtle : plan.highlight ? t.accent : t.ink,
+                      color: plan.ctaDisabled ? t.inkFaint : "#fff",
+                      border: "none",
+                      opacity: (plan.ctaDisabled || checkoutLoading === plan.name.toLowerCase()) ? 0.7 : 1,
+                    }}
+                  >
+                    {checkoutLoading === plan.name.toLowerCase() ? "Loading…" : plan.cta}
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Glossary modal */}
       {glossaryOpen && (

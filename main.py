@@ -14,11 +14,21 @@ import os
 import re
 import time
 
+import hashlib
+import hmac
+
 import jwt as pyjwt
 from jwt import PyJWKClient
+import sys, types as _types
+if "pkg_resources" not in sys.modules:
+    _pr = _types.ModuleType("pkg_resources")
+    _pr.DistributionNotFound = Exception
+    _pr.get_distribution = lambda *a, **kw: None
+    sys.modules["pkg_resources"] = _pr
+import razorpay
 import requests
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -52,6 +62,16 @@ if not DATABASE_URL:
         "will be disabled — extraction itself will still work normally."
     )
 
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
+rzp_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)) if RAZORPAY_KEY_ID else None
+
+TIER_PRICES_INR = {
+    "growth": 19900,   # paise
+    "pro":    49900,
+    "elite":  99900,
+}
+
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://iqlzvhqumjcfbulgjgqb.supabase.co")
 _jwks_url = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
 _jwks_client = PyJWKClient(_jwks_url, cache_keys=True)
@@ -82,6 +102,25 @@ def get_current_user(authorization: str = Header(None)) -> str | None:
         raise HTTPException(status_code=401, detail="Token has expired. Please sign in again.")
     except pyjwt.InvalidTokenError as e:
         logger.error(f"JWT verification failed: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+
+
+def get_current_user_with_email(authorization: str = Header(None)) -> tuple[str, str] | tuple[None, None]:
+    """Returns (user_id, email) from JWT, or (None, None) for guests."""
+    if not authorization or not authorization.startswith("Bearer "):
+        return None, None
+    token = authorization.split(" ", 1)[1]
+    try:
+        signing_key = _jwks_client.get_signing_key_from_jwt(token)
+        payload = pyjwt.decode(token, signing_key, algorithms=["ES256", "RS256", "HS256"], options={"verify_aud": False})
+        user_id = payload.get("sub")
+        email = payload.get("email", "")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Token has no subject claim.")
+        return user_id, email
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired. Please sign in again.")
+    except pyjwt.InvalidTokenError as e:
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
 
@@ -243,6 +282,82 @@ app.add_middleware(
 
 @app.get("/ping")
 def ping():
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Razorpay — create order
+# ---------------------------------------------------------------------------
+
+class CreateOrderRequest(BaseModel):
+    tier: str  # "growth" | "pro" | "elite"
+
+@app.post("/create-order")
+def create_order(body: CreateOrderRequest, user_id: str | None = Depends(get_current_user)):
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Sign in to upgrade.")
+    if not rzp_client:
+        raise HTTPException(status_code=503, detail="Payments not configured.")
+    tier = body.tier.lower()
+    amount = TIER_PRICES_INR.get(tier)
+    if not amount:
+        raise HTTPException(status_code=400, detail=f"Unknown tier: {tier}")
+    order = rzp_client.order.create({
+        "amount": amount,
+        "currency": "INR",
+        "notes": {"user_id": user_id, "tier": tier},
+    })
+    return {"order_id": order["id"], "amount": amount, "currency": "INR", "key_id": RAZORPAY_KEY_ID}
+
+
+# ---------------------------------------------------------------------------
+# Razorpay — webhook (called by Razorpay after successful payment)
+# ---------------------------------------------------------------------------
+
+@app.post("/razorpay-webhook")
+async def razorpay_webhook(request: Request):
+    body_bytes = await request.body()
+    sig = request.headers.get("X-Razorpay-Signature", "")
+    expected = hmac.new(RAZORPAY_KEY_SECRET.encode(), body_bytes, hashlib.sha256).hexdigest() if RAZORPAY_KEY_SECRET else ""  # noqa: S324
+    if not hmac.compare_digest(expected, sig):
+        raise HTTPException(status_code=400, detail="Invalid signature.")
+
+    event = json.loads(body_bytes)
+    if event.get("event") != "payment.captured":
+        return {"status": "ignored"}
+
+    notes = event["payload"]["payment"]["entity"].get("notes", {})
+    user_id = notes.get("user_id")
+    tier = notes.get("tier")
+    payment_id = event["payload"]["payment"]["entity"]["id"]
+    order_id = event["payload"]["payment"]["entity"]["order_id"]
+
+    if not user_id or not tier:
+        logger.warning("Webhook missing user_id or tier in notes")
+        return {"status": "ignored"}
+
+    if DATABASE_URL:
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO user_tiers (user_id, tier, razorpay_payment_id, razorpay_order_id, updated_at)
+                VALUES (%s, %s, %s, %s, now())
+                ON CONFLICT (user_id) DO UPDATE
+                SET tier = EXCLUDED.tier,
+                    razorpay_payment_id = EXCLUDED.razorpay_payment_id,
+                    razorpay_order_id = EXCLUDED.razorpay_order_id,
+                    reports_used_this_month = 0,
+                    billing_cycle_start = CURRENT_DATE,
+                    updated_at = now()
+            """, (user_id, tier, payment_id, order_id))
+            conn.commit()
+            cur.close()
+            conn.close()
+            logger.info(f"Upgraded user {user_id} to {tier}")
+        except Exception:
+            logger.exception("Failed to update user tier after payment")
+
     return {"status": "ok"}
 
 DEFAULT_COLUMNS = [
@@ -635,6 +750,63 @@ def get_cached_extraction(company_name: str, quarter_year: str, columns: list[st
         return None
 
 
+TIER_LIMITS = {
+    "free":   10,
+    "growth": 50,
+    "pro":    150,
+    "elite":  None,  # unlimited
+}
+
+def check_and_increment_usage(user_id: str | None, email: str = ""):
+    """
+    For signed-in users: enforce monthly limits based on their tier.
+    Raises HTTPException(402) if limit exceeded.
+    """
+    if not user_id or not DATABASE_URL:
+        return
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # Upsert user into user_tiers if not present, reset if new billing cycle
+        cur.execute("""
+            INSERT INTO user_tiers (user_id, email, tier, reports_used_this_month, billing_cycle_start)
+            VALUES (%s, %s, 'free', 0, date_trunc('month', CURRENT_DATE))
+            ON CONFLICT (user_id) DO UPDATE
+            SET reports_used_this_month = CASE
+                WHEN user_tiers.billing_cycle_start < date_trunc('month', CURRENT_DATE)
+                THEN 0
+                ELSE user_tiers.reports_used_this_month
+            END,
+            billing_cycle_start = CASE
+                WHEN user_tiers.billing_cycle_start < date_trunc('month', CURRENT_DATE)
+                THEN date_trunc('month', CURRENT_DATE)
+                ELSE user_tiers.billing_cycle_start
+            END,
+            email = COALESCE(EXCLUDED.email, user_tiers.email)
+        """, (user_id, email or None))
+        conn.commit()
+
+        cur.execute("SELECT tier, reports_used_this_month FROM user_tiers WHERE user_id = %s", (user_id,))
+        row = cur.fetchone()
+        if not row:
+            cur.close(); conn.close(); return
+        tier, used = row
+        limit = TIER_LIMITS.get(tier, 10)
+        if limit is not None and used >= limit:
+            cur.close(); conn.close()
+            raise HTTPException(
+                status_code=402,
+                detail=f"LIMIT_REACHED|{tier}|{used}|{limit}"
+            )
+        cur.execute("UPDATE user_tiers SET reports_used_this_month = reports_used_this_month + 1, updated_at = now() WHERE user_id = %s", (user_id,))
+        conn.commit()
+        cur.close(); conn.close()
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to check/increment usage — allowing extraction")
+
+
 def _extract_one(filename: str, file_bytes: bytes, active_columns: list[str], user_id: str | None = None, force_refresh: bool = False) -> dict:
     """Shared logic for a single file. Raises HTTPException on failure."""
     logger.info(f"=== Starting extraction for '{filename}' ===")
@@ -697,8 +869,10 @@ async def extract_transcript(
     file: UploadFile = File(...),
     columns: str = None,
     force_refresh: bool = False,
-    user_id: str | None = Depends(get_current_user),
+    user_and_email: tuple = Depends(get_current_user_with_email),
 ):
+    user_id, email = user_and_email
+    check_and_increment_usage(user_id, email)
     active_columns = _resolve_columns(columns)
     file_bytes = await file.read()
     row = await run_in_threadpool(_extract_one, file.filename, file_bytes, active_columns, user_id, force_refresh)
