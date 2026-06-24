@@ -229,15 +229,18 @@ def get_prior_quarter_values(company_name: str, exclude_quarter_year: str, field
 
 app = FastAPI(title="Concall Insight Extractor API")
 
-# Allow the local frontend (and later, your deployed frontend) to call this API.
-# Tighten this list before going to production.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: restrict to your real frontend domain in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/ping")
+def ping():
+    return {"status": "ok"}
 
 DEFAULT_COLUMNS = [
     "Company Name",

@@ -1101,7 +1101,7 @@ async function fetchConsistencyForRow(rowData, columns, session) {
     citable.map(async (fieldName) => {
       const value = rowData[fieldName]?.value || "";
       const params = new URLSearchParams({ company_name: companyName, field_name: fieldName, current_value: value, current_quarter_year: quarterYear });
-      const res = await fetch(`${API_BASE_URL}/consistency?${params.toString()}`, { headers });
+      const res = await fetch(`${API_BASE_URL}/consistency?${params.toString()}`, { headers, signal: AbortSignal.timeout(30000) });
       if (!res.ok) return [fieldName, null];
       const data = await res.json();
       return [fieldName, data];
