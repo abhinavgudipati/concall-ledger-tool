@@ -976,8 +976,8 @@ def get_reports(user_id: str | None = Depends(get_current_user)):
         cur.close()
         conn.close()
         return {"reports": [{"company_name": r[0], "quarter_year": r[1], "extracted_at": r[2].isoformat()} for r in rows]}
-    except Exception:
-        logger.exception("Failed to fetch reports list")
+    except Exception as e:
+        logger.exception(f"Failed to fetch reports list: {e}")
         return {"reports": []}
 
 
