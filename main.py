@@ -951,8 +951,10 @@ class PriorQuartersResponse(BaseModel):
 @app.get("/reports")
 def get_reports(user_id: str | None = Depends(get_current_user)):
     """Returns all distinct company+quarter reports for the signed-in user, most recent first."""
+    logger.info(f"/reports called with user_id='{user_id}'")
     if not user_id:
-        raise HTTPException(status_code=401, detail="Sign in to view your reports.")
+        logger.warning("/reports: no user_id, returning empty")
+        return {"reports": []}
     if not DATABASE_URL:
         return {"reports": []}
     try:
