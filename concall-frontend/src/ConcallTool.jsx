@@ -394,7 +394,7 @@
 //         <div
 //           className="header-row"
 //           style={{
-//             maxWidth: "1320px",
+//             maxWidth: "1800px",
 //             margin: "0 auto",
 //             padding: "22px 32px",
 //             display: "flex",
@@ -461,7 +461,7 @@
 //         </div>
 //       </div>
 
-//       <div style={{ maxWidth: "1320px", margin: "0 auto", padding: "36px 32px 72px" }}>
+//       <div className="main-content" style={{ maxWidth: "1800px", margin: "0 auto", padding: "36px 48px 72px" }}>
 //         {/* Intro line */}
 //         <p
 //           className="display"
@@ -474,7 +474,7 @@
 //             color: t.ink,
 //           }}
 //         >
-//           Drop in transcripts. Pull out what management actually promised.
+//           The transcript is 50 pages. Management declares it in one line. We track it every quarter.
 //         </p>
 
 //         {/* Column config */}
@@ -777,7 +777,7 @@
 //               background: t.panel,
 //             }}
 //           >
-//             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px" }}>
+//             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "14px" }}>
 //               <thead>
 //                 <tr style={{ background: t.headerBg }}>
 //                   {columns.map((c) => (
@@ -1009,8 +1009,8 @@ const THEMES = {
     bgSubtle: "#F2F1EC",
     panel: "#FFFFFF",
     ink: "#13151A",
-    inkMuted: "#5B6B5E",
-    inkFaint: "#9B9D94",
+    inkMuted: "#3A4A3D",
+    inkFaint: "#6B6E66",
     accent: "#1F4D3D",
     accentBg: "#E8F0EA",
     rust: "#9B5B3E",
@@ -1043,11 +1043,11 @@ async function authHeaders(session) {
   return { Authorization: `Bearer ${session.access_token}` };
 }
 
-async function extractViaBackend(file, columns, session) {
+async function extractViaBackend(file, columns, session, forceRefresh = false) {
   const formData = new FormData();
   formData.append("file", file);
 
-  const params = new URLSearchParams({ columns: columns.join(",") });
+  const params = new URLSearchParams({ columns: columns.join(","), force_refresh: forceRefresh });
 
   const response = await fetch(`${API_BASE_URL}/extract?${params.toString()}`, {
     method: "POST",
@@ -1195,11 +1195,61 @@ export default function ConcallTool() {
     await supabase.auth.signOut();
     setRows([]);
     setFiles([]);
+    setPastReports([]);
   };
 
+  // --- PAST REPORTS SIDEBAR ---
+  const [pastReports, setPastReports] = useState([]);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+
+  // --- GLOSSARY ---
+  const [glossaryOpen, setGlossaryOpen] = useState(false);
+  const [onboardingDismissed, setOnboardingDismissed] = useState(
+    () => localStorage.getItem("concalls_onboarding_dismissed") === "true"
+  );
+  const dismissOnboarding = () => {
+    localStorage.setItem("concalls_onboarding_dismissed", "true");
+    setOnboardingDismissed(true);
+  };
+
+  const GLOSSARY = [
+    { term: "Company Name", def: "The company whose earnings call transcript was uploaded. Extracted automatically from the PDF." },
+    { term: "Quarter and Year", def: "The financial quarter and fiscal year the call covers — e.g. Q4-2025 means the fourth quarter of fiscal year 2025." },
+    { term: "Growth Guidance", def: "Revenue or volume targets set by management for the next quarter or year. Often given as a percentage range or absolute figure." },
+    { term: "Margin Guidance", def: "Management's expected profitability margins — gross, EBITDA, or PAT — for the upcoming period." },
+    { term: "Capex / Expansion", def: "Capital expenditure plans: how much the company intends to spend on new facilities, equipment, or expansion into new markets." },
+    { term: "Order Book", def: "The total value of confirmed orders not yet fulfilled. A high order book signals future revenue visibility." },
+    { term: "Key Risk", def: "Risks management explicitly acknowledged — macro headwinds, input costs, regulatory changes, or competitive threats." },
+    { term: "Key Takeaway", def: "The single most important signal from the call — what management is really communicating about the business direction." },
+  ];
+
+  useEffect(() => {
+    if (!session) { setPastReports([]); return; }
+    fetch(`${API_BASE_URL}/reports`, { headers: { Authorization: `Bearer ${session.access_token}` } })
+      .then(r => r.json())
+      .then(data => setPastReports(data.reports || []))
+      .catch(() => {});
+  }, [session]);
+
+  const loadPastReport = async (company_name, quarter_year) => {
+    if (!session) return;
+    const params = new URLSearchParams({ company_name, quarter_year, columns: columns.join(",") });
+    const res = await fetch(`${API_BASE_URL}/report?${params}`, { headers: { Authorization: `Bearer ${session.access_token}` } });
+    if (!res.ok) return;
+    const data = await res.json();
+    const rowId = ++idCounter.current;
+    const consistency = await fetchConsistencyForRow(data.row, columns, session).catch(() => ({}));
+    setRows(prev => [...prev, { id: rowId, fileName: `${company_name} ${quarter_year}`, file: null, data: data.row, consistency, mintedAt: Date.now() }]);
+  };
+
+  // Group past reports by company
+  const reportsByCompany = pastReports.reduce((acc, r) => {
+    if (!acc[r.company_name]) acc[r.company_name] = [];
+    acc[r.company_name].push(r);
+    return acc;
+  }, {});
+
   const [columns, setColumns] = useState(DEFAULT_COLUMNS);
-  const [editingColumns, setEditingColumns] = useState(false);
-  const [columnDraft, setColumnDraft] = useState(DEFAULT_COLUMNS.join(", "));
   const [files, setFiles] = useState([]);
   const [rows, setRows] = useState([]);
   const [expandedRows, setExpandedRows] = useState(new Set());
@@ -1296,8 +1346,34 @@ export default function ConcallTool() {
       const rowId = ++idCounter.current;
       setRows((prev) => [
         ...prev,
-        { id: rowId, fileName: entry.name, data: rowData, consistency, mintedAt: Date.now() },
+        { id: rowId, fileName: entry.name, file: entry.file, data: rowData, consistency, mintedAt: Date.now() },
       ]);
+
+      // Refresh sidebar past reports
+      if (sessionRef.current) {
+        fetch(`${API_BASE_URL}/reports`, { headers: { Authorization: `Bearer ${sessionRef.current.access_token}` } })
+          .then(r => r.json())
+          .then(data => setPastReports(data.reports || []))
+          .catch(() => {});
+      }
+
+      // Re-fetch consistency for all existing rows — a newly uploaded quarter
+      // may be the prior quarter that other rows were waiting for
+      if (sessionRef.current) {
+        setRows((prev) =>
+          prev.map((r) => {
+            if (r.id === rowId) return r;
+            fetchConsistencyForRow(r.data, columnsRef.current, sessionRef.current)
+              .then((newConsistency) => {
+                setRows((latest) =>
+                  latest.map((lr) => lr.id === r.id ? { ...lr, consistency: newConsistency } : lr)
+                );
+              })
+              .catch(() => {});
+            return r;
+          })
+        );
+      }
       setFiles((prev) =>
         prev.map((f) => (f.id === entry.id ? { ...f, status: STATUS.DONE } : f))
       );
@@ -1434,12 +1510,6 @@ export default function ConcallTool() {
     processQueue([entry]);
   };
 
-  const applyColumnEdit = () => {
-    const newCols = columnDraft.split(",").map((c) => c.trim()).filter(Boolean);
-    if (newCols.length > 0) setColumns(newCols);
-    setEditingColumns(false);
-  };
-
   const activeCount = files.filter(
     (f) => f.status === STATUS.EXTRACTING || f.status === STATUS.QUEUED
   ).length;
@@ -1461,7 +1531,8 @@ export default function ConcallTool() {
     >
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
-        * { box-sizing: border-box; }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        html, body, #root { width: 100%; min-height: 100vh; }
         .display { font-family: 'Fraunces', serif; font-optical-sizing: auto; }
         .mono { font-family: 'JetBrains Mono', monospace; }
         button { font-family: inherit; }
@@ -1508,9 +1579,17 @@ export default function ConcallTool() {
         .icon-btn:hover { opacity: 1 !important; }
 
         @media (max-width: 720px) {
-          .header-row { flex-direction: column; align-items: flex-start !important; gap: 14px; }
+          .sidebar { display: none !important; }
+          .header-row { flex-direction: column; align-items: flex-start !important; gap: 10px; padding: 14px 16px !important; }
+          .header-right { flex-wrap: wrap; gap: 8px !important; }
           .toolbar-row { flex-direction: column; align-items: stretch !important; }
           .toolbar-row > div:last-child { align-self: flex-end; }
+          .main-content { padding: 20px 16px 48px !important; }
+          .display-heading { font-size: 18px !important; }
+          .export-btns { flex-wrap: wrap !important; }
+          table { font-size: 11px !important; }
+          td, th { padding: 8px 10px !important; max-width: 140px !important; }
+          .dropzone-area { padding: 20px 14px !important; }
         }
 
         /* LIVE OVERVIEW OVERLAY FOCUS TRACKERS */
@@ -1598,9 +1677,9 @@ export default function ConcallTool() {
         <div
           className="header-row"
           style={{
-            maxWidth: "1320px",
+            maxWidth: "1800px",
             margin: "0 auto",
-            padding: "22px 32px",
+            padding: "22px 48px",
             display: "flex",
             justifyContent: "space-between",
             alignItems: "center",
@@ -1626,7 +1705,7 @@ export default function ConcallTool() {
             </span>
           </div>
 
-          <div style={{ display: "flex", alignItems: "center", gap: "14px" }}>
+          <div className="header-right" style={{ display: "flex", alignItems: "center", gap: "14px" }}>
             <span className="mono" style={{ fontSize: "11.5px", opacity: 0.6 }}>
               {rows.length} extracted
               {activeCount > 0
@@ -1724,9 +1803,75 @@ export default function ConcallTool() {
         </div>
       </div>
 
-      <div style={{ maxWidth: "1320px", margin: "0 auto", padding: "36px 32px 72px" }}>
+      <div style={{ display: "flex", maxWidth: "1800px", margin: "0 auto" }}>
+
+        {/* --- SIDEBAR --- */}
+        {session && (
+          <div className="sidebar" style={{
+            width: sidebarOpen ? "220px" : "40px",
+            minWidth: sidebarOpen ? "220px" : "40px",
+            borderRight: `1px solid ${t.hairline}`,
+            background: t.panel,
+            transition: "width 0.2s ease, min-width 0.2s ease",
+            display: "flex",
+            flexDirection: "column",
+            minHeight: "calc(100vh - 69px)",
+            overflow: "hidden",
+          }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "16px 12px 10px", borderBottom: `1px solid ${t.hairline}` }}>
+              {sidebarOpen && (
+                <span className="mono" style={{ fontSize: "10px", letterSpacing: "0.1em", color: t.inkFaint, fontWeight: 600 }}>
+                  PAST REPORTS
+                </span>
+              )}
+              <button
+                onClick={() => setSidebarOpen(o => !o)}
+                style={{ background: "none", border: "none", cursor: "pointer", color: t.inkFaint, fontSize: "14px", padding: "2px 4px", marginLeft: "auto" }}
+                title={sidebarOpen ? "Collapse sidebar" : "Expand sidebar"}
+              >
+                {sidebarOpen ? "◂" : "▸"}
+              </button>
+            </div>
+
+            {sidebarOpen && (
+              <div style={{ overflowY: "auto", flex: 1, padding: "8px 0" }}>
+                {Object.keys(reportsByCompany).length === 0 ? (
+                  <p style={{ fontSize: "11px", color: t.inkFaint, padding: "12px", lineHeight: 1.5 }}>
+                    Your extracted reports will appear here.
+                  </p>
+                ) : (
+                  Object.entries(reportsByCompany).map(([company, reports]) => (
+                    <div key={company} style={{ marginBottom: "12px" }}>
+                      <div style={{ fontSize: "10.5px", fontWeight: 600, color: t.inkMuted, padding: "4px 12px 2px", letterSpacing: "0.02em" }}>
+                        {company}
+                      </div>
+                      {reports.map(r => (
+                        <button
+                          key={r.quarter_year}
+                          onClick={() => loadPastReport(r.company_name, r.quarter_year)}
+                          style={{
+                            display: "block", width: "100%", textAlign: "left",
+                            padding: "5px 12px 5px 20px", background: "none", border: "none",
+                            cursor: "pointer", fontSize: "11.5px", color: t.inkMuted,
+                            fontFamily: "'JetBrains Mono', monospace",
+                          }}
+                          onMouseEnter={e => e.currentTarget.style.background = t.bgSubtle}
+                          onMouseLeave={e => e.currentTarget.style.background = "none"}
+                        >
+                          {r.quarter_year}
+                        </button>
+                      ))}
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="main-content" style={{ flex: 1, padding: "36px 48px 72px", minWidth: 0 }}>
         <p
-          className="display"
+          className="display display-heading"
           style={{
             fontSize: "26px",
             fontWeight: 500,
@@ -1736,7 +1881,7 @@ export default function ConcallTool() {
             color: t.ink,
           }}
         >
-          Drop in transcripts. Pull out what management actually promised.
+          The transcript is 50 pages. Management declares it in one line. We track it every quarter.
         </p>
 
         {/* Column config row */}
@@ -1752,101 +1897,43 @@ export default function ConcallTool() {
             borderBottom: `1px solid ${t.hairline}`,
           }}
         >
-          {!editingColumns ? (
-            <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+            <span
+              className="mono"
+              style={{ fontSize: "10.5px", color: t.inkFaint, letterSpacing: "0.1em", marginRight: "4px" }}
+            >
+              FIELDS
+            </span>
+            {columns.map((c) => (
               <span
+                key={c}
                 className="mono"
-                style={{ fontSize: "10.5px", color: t.inkFaint, letterSpacing: "0.1em", marginRight: "4px" }}
-              >
-                FIELDS
-              </span>
-              {columns.map((c) => (
-                <span
-                  key={c}
-                  className="mono"
-                  style={{
-                    fontSize: "11.5px",
-                    color: t.inkMuted,
-                    background: t.bgSubtle,
-                    border: `1px solid ${t.hairline}`,
-                    borderRadius: "4px",
-                    padding: "4px 9px",
-                  }}
-                >
-                  {c}
-                </span>
-              ))}
-              <button
-                onClick={() => {
-                  setColumnDraft(columns.join(", "));
-                  setEditingColumns(true);
-                }}
                 style={{
-                  background: "none",
-                  border: "none",
-                  color: t.accent,
-                  fontSize: "12px",
-                  fontWeight: 600,
-                  cursor: "pointer",
-                  padding: "4px 6px",
-                }}
-              >
-                Edit fields →
-              </button>
-            </div>
-          ) : (
-            <div style={{ display: "flex", gap: "8px", alignItems: "flex-start", flexWrap: "wrap", width: "100%" }}>
-              <textarea
-                value={columnDraft}
-                onChange={(e) => setColumnDraft(e.target.value)}
-                rows={2}
-                style={{
-                  flex: "1 1 400px",
-                  minWidth: "260px",
-                  padding: "9px 11px",
-                  border: `1px solid ${t.hairlineStrong}`,
-                  borderRadius: "6px",
-                  fontFamily: "'JetBrains Mono', monospace",
-                  fontSize: "12px",
-                  resize: "vertical",
-                  background: t.panel,
-                  color: t.ink,
-                }}
-                placeholder="Comma-separated field names"
-              />
-              <button
-                onClick={applyColumnEdit}
-                style={{
-                  background: t.accent,
-                  color: t.bg,
-                  border: "none",
-                  borderRadius: "6px",
-                  padding: "10px 18px",
-                  fontWeight: 600,
-                  fontSize: "13px",
-                  cursor: "pointer",
-                }}
-              >
-                Apply
-              </button>
-              <button
-                onClick={() => setEditingColumns(false)}
-                style={{
-                  background: "none",
-                  border: `1px solid ${t.hairline}`,
-                  borderRadius: "6px",
-                  padding: "10px 18px",
-                  fontSize: "13px",
-                  cursor: "pointer",
+                  fontSize: "11.5px",
                   color: t.inkMuted,
+                  background: t.bgSubtle,
+                  border: `1px solid ${t.hairline}`,
+                  borderRadius: "4px",
+                  padding: "4px 9px",
                 }}
               >
-                Cancel
-              </button>
-            </div>
-          )}
+                {c}
+              </span>
+            ))}
+            <button
+              onClick={() => setGlossaryOpen(true)}
+              style={{
+                background: "none", border: `1px solid ${t.hairline}`, borderRadius: "6px",
+                color: t.inkMuted, cursor: "pointer", fontSize: "12px", padding: "4px 10px",
+                fontFamily: "inherit",
+              }}
+              title="What do these fields mean?"
+            >
+              ? What do these mean
+            </button>
+          </div>
 
-          <div id="tour-copy" style={{ flexShrink: 0, display: "flex", gap: "8px", flexWrap: "wrap" }}>
+          <div id="tour-copy" className="export-btns" style={{ flexShrink: 0, display: "flex", gap: "8px", flexWrap: "wrap" }}>
             <button
               onClick={copyTable}
               disabled={rows.length === 0}
@@ -1925,7 +2012,7 @@ export default function ConcallTool() {
         {/* Drop zone */}
         <div
           id="tour-dropzone"
-          className="dropzone"
+          className="dropzone dropzone-area"
           onDragOver={(e) => {
             e.preventDefault();
             setIsDragging(true);
@@ -2030,6 +2117,40 @@ export default function ConcallTool() {
           </div>
         )}
 
+        {/* Onboarding banner — shown to first-time users when a result appears */}
+        {rows.length > 0 && !onboardingDismissed && (
+          <div style={{
+            display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: "16px",
+            background: t.accentBg, border: `1px solid ${t.accent}22`, borderRadius: "10px",
+            padding: "14px 18px", marginBottom: "20px",
+          }}>
+            <div style={{ display: "flex", gap: "12px", alignItems: "flex-start" }}>
+              <span style={{ fontSize: "20px", lineHeight: 1 }}>📖</span>
+              <div>
+                <div style={{ fontSize: "13px", fontWeight: 600, color: t.accent, marginBottom: "3px" }}>
+                  First time here? Here's what each column means.
+                </div>
+                <div style={{ fontSize: "12px", color: t.inkMuted, lineHeight: 1.5 }}>
+                  Each column tracks a specific type of management guidance — growth targets, margin expectations, risks, and more.{" "}
+                  <button
+                    onClick={() => setGlossaryOpen(true)}
+                    style={{ background: "none", border: "none", color: t.accent, cursor: "pointer", fontSize: "12px", fontWeight: 600, padding: 0, textDecoration: "underline" }}
+                  >
+                    Open glossary →
+                  </button>
+                </div>
+              </div>
+            </div>
+            <button
+              onClick={dismissOnboarding}
+              style={{ background: "none", border: "none", color: t.inkFaint, cursor: "pointer", fontSize: "16px", flexShrink: 0, padding: "0 4px" }}
+              title="Dismiss"
+            >
+              ×
+            </button>
+          </div>
+        )}
+
         {/* Table */}
         {rows.length > 0 ? (
           <div
@@ -2041,7 +2162,7 @@ export default function ConcallTool() {
               background: t.panel,
             }}
           >
-            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "14px" }}>
               <thead>
                 <tr style={{ background: t.headerBg }}>
                   {columns.map((c) => (
@@ -2112,9 +2233,10 @@ export default function ConcallTool() {
                                 <span
                                   title={exclusionNote || undefined}
                                   style={{
-                                    color: t.inkFaint,
+                                    color: t.inkMuted,
+                                    fontSize: "13px",
                                     cursor: exclusionNote ? "help" : "default",
-                                    borderBottom: exclusionNote ? `1px dashed ${t.inkFaint}` : "none",
+                                    borderBottom: exclusionNote ? `1px dashed ${t.inkMuted}` : "none",
                                   }}
                                 >
                                   No explicit guidance
@@ -2197,8 +2319,8 @@ export default function ConcallTool() {
                               style={{
                                 background: "none",
                                 border: "none",
-                                color: isExpanded ? t.accent : t.inkFaint,
-                                opacity: isExpanded ? 1 : 0.6,
+                                color: isExpanded ? t.accent : t.inkMuted,
+                                opacity: isExpanded ? 1 : 0.7,
                                 cursor: "pointer",
                                 fontSize: "11px",
                                 padding: "0 6px",
@@ -2206,7 +2328,23 @@ export default function ConcallTool() {
                               aria-label={isExpanded ? "Hide sources" : "Show sources"}
                               title={isExpanded ? "Hide sources" : "Show sources"}
                             >
-                              {isExpanded ? "▾ source" : "▸ source"}
+                              {isExpanded ? "▾ Hide quote" : "▸ View quote"}
+                            </button>
+                          )}
+                          {session && (
+                            <button
+                              onClick={async () => {
+                                const entry = { id: r.id, file: r.file, name: r.fileName, status: STATUS.QUEUED, error: null };
+                                if (!r.file) return;
+                                setRows(prev => prev.map(row => row.id === r.id ? { ...row, mintedAt: Date.now() } : row));
+                                const rowData = await extractViaBackend(r.file, columnsRef.current, sessionRef.current, true);
+                                setRows(prev => prev.map(row => row.id === r.id ? { ...row, data: rowData, mintedAt: Date.now() } : row));
+                              }}
+                              className="icon-btn"
+                              style={{ background: "none", border: "none", color: t.inkMuted, opacity: 0.7, cursor: "pointer", fontSize: "10px", padding: "0 4px", whiteSpace: "nowrap" }}
+                              title="Re-extract this report fresh from the PDF"
+                            >
+                              Re-extract
                             </button>
                           )}
                           <button
@@ -2215,14 +2353,16 @@ export default function ConcallTool() {
                             style={{
                               background: "none",
                               border: "none",
-                              color: t.inkFaint,
-                              opacity: 0.5,
+                              color: t.inkMuted,
+                              opacity: 0.7,
                               cursor: "pointer",
-                              fontSize: "14px",
+                              fontSize: "10px",
+                              whiteSpace: "nowrap",
                             }}
                             aria-label={`Remove row for ${getCellValue(r.data["Company Name"]) || r.fileName}`}
+                            title="Remove this row"
                           >
-                            ×
+                            Remove
                           </button>
                         </td>
                       </tr>
@@ -2358,7 +2498,50 @@ export default function ConcallTool() {
             </button>
           </div>
         )}
-      </div>
+        </div> {/* end main-content */}
+      </div> {/* end sidebar+content flex */}
+
+      {/* Glossary modal */}
+      {glossaryOpen && (
+        <div
+          onClick={() => setGlossaryOpen(false)}
+          style={{
+            position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", zIndex: 1000,
+            display: "flex", alignItems: "center", justifyContent: "center", padding: "24px",
+          }}
+        >
+          <div
+            onClick={e => e.stopPropagation()}
+            style={{
+              background: t.panel, borderRadius: "14px", maxWidth: "540px", width: "100%",
+              maxHeight: "80vh", overflowY: "auto", boxShadow: "0 20px 60px rgba(0,0,0,0.2)",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "20px 24px 16px", borderBottom: `1px solid ${t.hairline}` }}>
+              <div>
+                <div style={{ fontSize: "16px", fontWeight: 700, color: t.ink }}>Field Glossary</div>
+                <div style={{ fontSize: "12px", color: t.inkMuted, marginTop: "2px" }}>What each column in your report tracks</div>
+              </div>
+              <button
+                onClick={() => setGlossaryOpen(false)}
+                style={{ background: "none", border: "none", color: t.inkFaint, cursor: "pointer", fontSize: "20px", padding: "0 4px" }}
+              >
+                ×
+              </button>
+            </div>
+            <div style={{ padding: "8px 0 16px" }}>
+              {GLOSSARY.map(({ term, def }) => (
+                <div key={term} style={{ padding: "14px 24px", borderBottom: `1px solid ${t.hairline}` }}>
+                  <div style={{ fontSize: "13px", fontWeight: 600, color: t.ink, marginBottom: "4px", fontFamily: "'JetBrains Mono', monospace" }}>
+                    {term.toUpperCase()}
+                  </div>
+                  <div style={{ fontSize: "13px", color: t.inkMuted, lineHeight: 1.6 }}>{def}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

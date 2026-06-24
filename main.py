@@ -114,24 +114,27 @@ def save_extraction(company_name: str, quarter_year: str, filename: str, row: di
             value = field_data.get("value", "") if isinstance(field_data, dict) else str(field_data)
             source_quote = field_data.get("source_quote", "") if isinstance(field_data, dict) else ""
             confidence = field_data.get("confidence", "") if isinstance(field_data, dict) else ""
+            mgmt_confidence = field_data.get("mgmt_confidence", 0) if isinstance(field_data, dict) else 0
+            mgmt_confidence_reason = field_data.get("mgmt_confidence_reason", "") if isinstance(field_data, dict) else ""
+            cur.execute(
+                """
+                DELETE FROM extractions
+                WHERE company_name = %s
+                  AND quarter_year = %s
+                  AND field_name = %s
+                  AND (user_id = %s OR (user_id IS NULL AND %s IS NULL))
+                """,
+                (company_name, quarter_year, field_name, user_id, user_id),
+            )
             cur.execute(
                 """
                 INSERT INTO extractions
-                    (company_name, quarter_year, field_name, value, source_quote, confidence, filename, user_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (company_name, quarter_year, field_name, user_id)
-                DO UPDATE SET
-                    value        = EXCLUDED.value,
-                    source_quote = EXCLUDED.source_quote,
-                    confidence   = EXCLUDED.confidence,
-                    filename     = EXCLUDED.filename,
-                    extracted_at = now()
-                WHERE extractions.company_name  = EXCLUDED.company_name
-                  AND extractions.quarter_year  = EXCLUDED.quarter_year
-                  AND extractions.field_name    = EXCLUDED.field_name
-                  AND extractions.user_id       = EXCLUDED.user_id
+                    (company_name, quarter_year, field_name, value, source_quote, source_page, confidence, mgmt_confidence, mgmt_confidence_reason, filename, user_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
-                (company_name, quarter_year, field_name, value, source_quote, confidence, filename, user_id),
+                (company_name, quarter_year, field_name, value, source_quote,
+                 field_data.get("source_page", 0) if isinstance(field_data, dict) else 0,
+                 confidence, mgmt_confidence, mgmt_confidence_reason, filename, user_id),
             )
         conn.commit()
         cur.close()
@@ -583,7 +586,56 @@ def _resolve_columns(columns: str | None) -> list[str]:
     return DEFAULT_COLUMNS
 
 
-def _extract_one(filename: str, file_bytes: bytes, active_columns: list[str], user_id: str | None = None) -> dict:
+def get_cached_extraction(company_name: str, quarter_year: str, columns: list[str], user_id: str) -> dict | None:
+    """
+    Returns a fully reconstructed row dict from DB if all requested fields
+    exist for this user + company + quarter. Returns None if anything is missing.
+    Only available for signed-in users — guests never get cached results.
+    """
+    if not DATABASE_URL or not user_id:
+        return None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        citable = [c for c in columns if c not in ("Company Name", "Quarter and Year")]
+        cur.execute(
+            """
+            SELECT field_name, value, source_quote, source_page, confidence, mgmt_confidence, mgmt_confidence_reason
+            FROM extractions
+            WHERE company_name = %s
+              AND quarter_year = %s
+              AND user_id = %s
+              AND field_name = ANY(%s)
+            """,
+            (company_name, quarter_year, user_id, citable),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        if len(rows) < len(citable):
+            return None
+        row = {
+            "Company Name": {"value": company_name, "source_quote": "", "source_page": 0, "mgmt_confidence": 0, "mgmt_confidence_reason": "", "exclusion_note": ""},
+            "Quarter and Year": quarter_year,
+        }
+        for field_name, value, source_quote, source_page, confidence, mgmt_confidence, mgmt_confidence_reason in rows:
+            row[field_name] = {
+                "value": value or "",
+                "source_quote": source_quote or "",
+                "source_page": source_page or 0,
+                "confidence": confidence or "N/A",
+                "mgmt_confidence": mgmt_confidence or 0,
+                "mgmt_confidence_reason": mgmt_confidence_reason or "",
+                "exclusion_note": "",
+            }
+        logger.info(f"Cache HIT for '{company_name}' {quarter_year} user={user_id}")
+        return row
+    except Exception:
+        logger.exception(f"Cache lookup failed for '{company_name}' {quarter_year}")
+        return None
+
+
+def _extract_one(filename: str, file_bytes: bytes, active_columns: list[str], user_id: str | None = None, force_refresh: bool = False) -> dict:
     """Shared logic for a single file. Raises HTTPException on failure."""
     logger.info(f"=== Starting extraction for '{filename}' ===")
 
@@ -601,6 +653,13 @@ def _extract_one(filename: str, file_bytes: bytes, active_columns: list[str], us
             detail="Could not extract text from this PDF — it may be scanned/image-based.",
         )
 
+    # Quick peek at company + quarter from filename/text to attempt cache lookup
+    # before paying the Gemini cost. We do a lightweight pre-parse for this.
+    if not force_refresh and user_id:
+        # Try to infer company+quarter from a fast Gemini mini-call or skip —
+        # instead we do the full extraction but check cache after we know the key.
+        pass
+
     prompt = build_prompt(active_columns, text)
 
     try:
@@ -609,9 +668,15 @@ def _extract_one(filename: str, file_bytes: bytes, active_columns: list[str], us
         logger.error(f"Extraction failed for '{filename}': {type(e).__name__}: {e}")
         raise HTTPException(status_code=502, detail=f"Extraction failed: {e}")
 
-    # Augment each citable field with a derived confidence score, computed
-    # by checking the model's source_quote against the real transcript text
-    # — not by asking the model to self-rate, which is unreliable.
+    company_name = row.get("Company Name", {}).get("value", "") if isinstance(row.get("Company Name"), dict) else ""
+    quarter_year = row.get("Quarter and Year", "") if isinstance(row.get("Quarter and Year"), str) else ""
+
+    # Check cache after we know company+quarter — if cached, return that instead
+    if not force_refresh and user_id and company_name and quarter_year:
+        cached = get_cached_extraction(company_name, quarter_year, active_columns, user_id)
+        if cached:
+            return cached
+
     for field_name, field_data in row.items():
         if isinstance(field_data, dict) and "value" in field_data:
             field_data["confidence"] = compute_confidence(
@@ -620,11 +685,6 @@ def _extract_one(filename: str, file_bytes: bytes, active_columns: list[str], us
                 text,
             )
 
-    # Persist this extraction for future consistency comparisons. Failures
-    # here are logged but never block the response — history is a bonus,
-    # not a dependency of the core extraction feature.
-    company_name = row.get("Company Name", {}).get("value", "") if isinstance(row.get("Company Name"), dict) else ""
-    quarter_year = row.get("Quarter and Year", "") if isinstance(row.get("Quarter and Year"), str) else ""
     if company_name and quarter_year:
         save_extraction(company_name, quarter_year, filename, row, user_id=user_id)
 
@@ -636,11 +696,12 @@ def _extract_one(filename: str, file_bytes: bytes, active_columns: list[str], us
 async def extract_transcript(
     file: UploadFile = File(...),
     columns: str = None,
+    force_refresh: bool = False,
     user_id: str | None = Depends(get_current_user),
 ):
     active_columns = _resolve_columns(columns)
     file_bytes = await file.read()
-    row = await run_in_threadpool(_extract_one, file.filename, file_bytes, active_columns, user_id)
+    row = await run_in_threadpool(_extract_one, file.filename, file_bytes, active_columns, user_id, force_refresh)
     return ExtractResponse(filename=file.filename, row=row)
 
 
@@ -711,6 +772,52 @@ class PriorQuartersResponse(BaseModel):
     company_name: str
     field_name: str
     history: list[dict]
+
+
+@app.get("/reports")
+def get_reports(user_id: str | None = Depends(get_current_user)):
+    """Returns all distinct company+quarter reports for the signed-in user, most recent first."""
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Sign in to view your reports.")
+    if not DATABASE_URL:
+        return {"reports": []}
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT company_name, quarter_year, MAX(extracted_at) as extracted_at
+            FROM extractions
+            WHERE user_id = %s
+            GROUP BY company_name, quarter_year
+            ORDER BY MAX(extracted_at) DESC
+            """,
+            (user_id,),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return {"reports": [{"company_name": r[0], "quarter_year": r[1], "extracted_at": r[2].isoformat()} for r in rows]}
+    except Exception:
+        logger.exception("Failed to fetch reports list")
+        return {"reports": []}
+
+
+@app.get("/report")
+def get_report(
+    company_name: str,
+    quarter_year: str,
+    columns: str = None,
+    user_id: str | None = Depends(get_current_user),
+):
+    """Returns the full cached extraction for a specific company+quarter."""
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Sign in to view your reports.")
+    active_columns = _resolve_columns(columns)
+    cached = get_cached_extraction(company_name, quarter_year, active_columns, user_id)
+    if not cached:
+        raise HTTPException(status_code=404, detail="Report not found.")
+    return {"row": cached}
 
 
 @app.get("/history", response_model=PriorQuartersResponse)
