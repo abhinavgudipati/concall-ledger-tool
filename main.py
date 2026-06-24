@@ -951,16 +951,13 @@ class PriorQuartersResponse(BaseModel):
 @app.get("/reports")
 def get_reports(user_id: str | None = Depends(get_current_user)):
     """Returns all distinct company+quarter reports for the signed-in user, most recent first."""
-    logger.info(f"/reports called with user_id='{user_id}'")
     if not user_id:
-        logger.warning("/reports: no user_id, returning empty")
         return {"reports": []}
     if not DATABASE_URL:
         return {"reports": []}
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        logger.info(f"Fetching reports for user_id='{user_id}'")
         cur.execute(
             """
             SELECT company_name, quarter_year, MAX(extracted_at) as extracted_at
@@ -972,7 +969,6 @@ def get_reports(user_id: str | None = Depends(get_current_user)):
             (user_id,),
         )
         rows = cur.fetchall()
-        logger.info(f"Found {len(rows)} reports for user_id='{user_id}'")
         cur.close()
         conn.close()
         return {"reports": [{"company_name": r[0], "quarter_year": r[1], "extracted_at": r[2].isoformat()} for r in rows]}

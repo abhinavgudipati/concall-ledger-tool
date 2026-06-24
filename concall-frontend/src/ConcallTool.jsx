@@ -1309,9 +1309,9 @@ export default function ConcallTool() {
   useEffect(() => {
     if (!session) { setPastReports([]); return; }
     fetch(`${API_BASE_URL}/reports`, { headers: { Authorization: `Bearer ${session.access_token}` } })
-      .then(r => { console.log("GET /reports status:", r.status); return r.json(); })
-      .then(data => { console.log("GET /reports data:", data); console.log("reports length:", data.reports?.length); console.log("sidebarOpen:", sidebarOpen); setPastReports(data.reports || []); })
-      .catch(err => console.error("GET /reports error:", err));
+      .then(r => r.json())
+      .then(data => setPastReports(data.reports || []))
+      .catch(() => {});
   }, [session]);
 
   const loadPastReport = async (company_name, quarter_year) => {
