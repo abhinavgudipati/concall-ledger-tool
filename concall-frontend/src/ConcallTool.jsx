@@ -2797,6 +2797,22 @@ export default function ConcallTool() {
           </div>
         </div>
       )}
+
+      {/* Footer */}
+      <div style={{ textAlign: "center", padding: "32px 24px", borderTop: `1px solid ${t.hairline}`, marginTop: "0px" }}>
+        <div style={{ fontSize: "13px", color: t.inkFaint }}>
+          Built by <strong style={{ color: t.inkMuted }}>Abhinav Gudipati</strong>
+          {" · "}
+          <a
+            href="https://www.linkedin.com/in/abhinavgudipati/"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ color: t.accent, textDecoration: "none", fontWeight: 600 }}
+          >
+            Connect on LinkedIn →
+          </a>
+        </div>
+      </div>
     </div>
   );
 }
