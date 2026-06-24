@@ -1200,6 +1200,25 @@ export default function ConcallTool() {
     setPastReports([]);
   };
 
+  // --- USER TIER ---
+  const [userTier, setUserTier] = useState({ tier: "free", reports_used: 0, reports_limit: 10 });
+
+  useEffect(() => {
+    if (!session) { setUserTier({ tier: "free", reports_used: 0, reports_limit: 10 }); return; }
+    fetch(`${API_BASE_URL}/me`, { headers: { Authorization: `Bearer ${session.access_token}` } })
+      .then(r => r.json())
+      .then(data => setUserTier(data))
+      .catch(() => {});
+  }, [session]);
+
+  const refreshTier = () => {
+    if (!sessionRef.current) return;
+    fetch(`${API_BASE_URL}/me`, { headers: { Authorization: `Bearer ${sessionRef.current.access_token}` } })
+      .then(r => r.json())
+      .then(data => setUserTier(data))
+      .catch(() => {});
+  };
+
   // --- PAST REPORTS SIDEBAR ---
   const [pastReports, setPastReports] = useState([]);
   const [sidebarOpen, setSidebarOpen] = useState(window.innerWidth >= 900);
@@ -1432,12 +1451,13 @@ export default function ConcallTool() {
         { id: rowId, fileName: entry.name, file: entry.file, data: rowData, consistency, mintedAt: Date.now() },
       ]);
 
-      // Refresh sidebar past reports
+      // Refresh sidebar past reports + tier usage
       if (sessionRef.current) {
         fetch(`${API_BASE_URL}/reports`, { headers: { Authorization: `Bearer ${sessionRef.current.access_token}` } })
           .then(r => r.json())
           .then(data => setPastReports(data.reports || []))
           .catch(() => {});
+        refreshTier();
       }
 
       // Re-fetch consistency for all existing rows — a newly uploaded quarter
@@ -1760,6 +1780,9 @@ export default function ConcallTool() {
           background: t.headerBg,
           color: t.headerInk,
           borderBottom: `1px solid ${t.hairlineStrong}`,
+          position: "sticky",
+          top: 0,
+          zIndex: 100,
         }}
       >
         <div
@@ -1850,16 +1873,33 @@ export default function ConcallTool() {
             {/* Auth area */}
             {session ? (
               <div style={{ display: "flex", alignItems: "center", gap: "8px", marginLeft: "4px" }}>
-                <button
+                {/* Tier + usage badge */}
+                <span
                   onClick={() => setPricingOpen(true)}
                   style={{
-                    background: "#3FAE85", border: "none", borderRadius: "20px",
-                    padding: "5px 14px", fontSize: "11.5px", fontWeight: 700,
-                    color: "#fff", cursor: "pointer", letterSpacing: "0.02em",
+                    fontSize: "11px", color: "rgba(255,255,255,0.65)", cursor: "pointer",
+                    background: "rgba(255,255,255,0.08)", borderRadius: "20px",
+                    padding: "4px 10px", whiteSpace: "nowrap",
                   }}
+                  title="View plans"
                 >
-                  Upgrade ↑
-                </button>
+                  {userTier.tier.charAt(0).toUpperCase() + userTier.tier.slice(1)}
+                  {userTier.reports_limit !== null
+                    ? ` · ${userTier.reports_used}/${userTier.reports_limit} reports`
+                    : " · Unlimited"}
+                </span>
+                {userTier.tier === "free" && (
+                  <button
+                    onClick={() => setPricingOpen(true)}
+                    style={{
+                      background: "#3FAE85", border: "none", borderRadius: "20px",
+                      padding: "5px 14px", fontSize: "11.5px", fontWeight: 700,
+                      color: "#fff", cursor: "pointer", letterSpacing: "0.02em",
+                    }}
+                  >
+                    Upgrade ↑
+                  </button>
+                )}
                 {session.user?.user_metadata?.avatar_url ? (
                   <img
                     src={session.user.user_metadata.avatar_url}
@@ -2306,6 +2346,9 @@ export default function ConcallTool() {
                         }}
                       >
                         {columns.map((c) => {
+                          const isFreeUser = !session || userTier.tier === "free";
+                          const isLockedCol = c === "Key Risk" || c === "Key Takeaway";
+                          const isLocked = isFreeUser && isLockedCol;
                           const isTakeaway = c.toLowerCase().includes("takeaway");
                           const isRisk = c.toLowerCase().includes("risk");
                           const cellValue = getCellValue(r.data[c]);
@@ -2327,13 +2370,31 @@ export default function ConcallTool() {
                                 verticalAlign: "top",
                                 maxWidth: "260px",
                                 fontWeight: c === "Company Name" ? 600 : 400,
-                                color:
-                                  isRisk && cellValue && !isNoGuidance
-                                    ? t.rust
-                                    : t.ink,
+                                color: isRisk && cellValue && !isNoGuidance ? t.rust : t.ink,
+                                position: "relative",
                               }}
                             >
-                              {isNoGuidance ? (
+                              {isLocked ? (
+                                <div style={{ position: "relative" }}>
+                                  <div style={{ filter: "blur(4px)", userSelect: "none", pointerEvents: "none", opacity: 0.7, fontSize: "13px", lineHeight: 1.5 }}>
+                                    {cellValue || "Unlock to view"}
+                                  </div>
+                                  <div style={{
+                                    position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center",
+                                  }}>
+                                    <button
+                                      onClick={() => setPricingOpen(true)}
+                                      style={{
+                                        background: t.accent, color: "#fff", border: "none", borderRadius: "6px",
+                                        padding: "4px 10px", fontSize: "11px", fontWeight: 600, cursor: "pointer",
+                                        whiteSpace: "nowrap",
+                                      }}
+                                    >
+                                      🔒 Unlock
+                                    </button>
+                                  </div>
+                                </div>
+                              ) : isNoGuidance ? (
                                 <span
                                   title={exclusionNote || undefined}
                                   style={{
@@ -2360,7 +2421,7 @@ export default function ConcallTool() {
                                   —
                                 </span>
                               )}
-                              {session && consistencyIsNew && prevQuarter && c !== "Company Name" && c !== "Quarter and Year" && cellValue && cellValue !== "No explicit guidance" && (
+                              {!isLocked && session && consistencyIsNew && prevQuarter && c !== "Company Name" && c !== "Quarter and Year" && cellValue && cellValue !== "No explicit guidance" && (
                                 <div style={{ marginTop: "5px" }}>
                                   <span
                                     title={`Upload the ${prevQuarter} report to enable quarter-on-quarter comparison for this field`}
@@ -2375,7 +2436,7 @@ export default function ConcallTool() {
                                   </span>
                                 </div>
                               )}
-                              {(consistencyDisplay || mgmtConf) && (
+                              {!isLocked && (consistencyDisplay || mgmtConf) && (
                                 <div style={{ marginTop: "5px", display: "flex", gap: "4px", flexWrap: "wrap" }}>
                                   {consistencyDisplay && (
                                     <span
@@ -2492,22 +2553,25 @@ export default function ConcallTool() {
                                 VERIFIABLE CITATIONS
                               </span>
                               {citableColumns.map((c) => {
+                                const isFreeUser = !session || userTier.tier === "free";
+                                const isLockedCol = c === "Key Risk" || c === "Key Takeaway";
+                                const isCitationLocked = isFreeUser && isLockedCol;
                                 const quote = getCellSource(r.data[c]);
                                 const page = getCellPage(r.data[c]);
                                 const conf = getCellConfidence(r.data[c]);
                                 const confDisplay = conf ? CONFIDENCE_DISPLAY[conf] : null;
                                 const mgmtC = getMgmtConfidence(r.data[c]);
-                                if (!quote) return null;
+                                if (!quote && !isCitationLocked) return null;
                                 return (
-                                  <div key={c} style={{ fontSize: "12px", lineHeight: "1.45" }}>
+                                  <div key={c} style={{ fontSize: "12px", lineHeight: "1.45", position: "relative" }}>
                                     <strong style={{ color: t.inkMuted, fontSize: "11.5px" }}>{c}:</strong>{" "}
-                                    <span style={{ color: t.ink, fontStyle: "italic" }}>"{quote}"</span>
-                                    {page > 0 && (
+                                    <span style={{ color: t.ink, fontStyle: "italic", filter: isCitationLocked ? "blur(4px)" : "none", userSelect: isCitationLocked ? "none" : "auto" }}>"{isCitationLocked ? "Upgrade to view the source quote for this field." : quote}"</span>
+                                    {!isCitationLocked && page > 0 && (
                                       <span className="mono" style={{ fontSize: "10px", color: t.inkFaint, marginLeft: "6px", background: t.bgSubtle, padding: "2px 5px", borderRadius: "3px" }}>
                                         p. {page}
                                       </span>
                                     )}
-                                    {confDisplay && (
+                                    {!isCitationLocked && confDisplay && (
                                       <span
                                         title="Quote verification confidence"
                                         style={{
@@ -2524,7 +2588,7 @@ export default function ConcallTool() {
                                         {confDisplay.label}
                                       </span>
                                     )}
-                                    {mgmtC && (
+                                    {!isCitationLocked && mgmtC && (
                                       <span
                                         title={mgmtC.reason}
                                         style={{

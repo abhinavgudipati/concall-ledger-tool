@@ -494,7 +494,7 @@ RULES:
 - Standing long-term policies not reaffirmed for a specific upcoming period should be treated as IMPLIED at most, not EXPLICIT.
 - Mechanical or one-off effects (e.g. day-count quirks, base-effect comparisons) are not guidance — use NONE.
 - Do not add your own forecast or opinion.
-- "Company Name" should be the actual company name found in the transcript.
+- "Company Name" should be the official registered company name (as listed on BSE/NSE). Do not include leading "The" — e.g. use "Federal Bank Limited" not "The Federal Bank Limited". Use the most complete formal name including "Limited" or "Ltd".
 
 EXCLUSION NOTE — for each of these fields: {citation_field_list}
 - Also provide an "exclusion_note": if value is "No explicit guidance", write a brief phrase (under 12 words) explaining what, if anything, management said about this topic and why it did not qualify — e.g. "Referenced GDP-linked target but not for a named period" or "Topic not discussed". If guidance was found (explicit or implied), set exclusion_note to "".
@@ -946,6 +946,27 @@ class PriorQuartersResponse(BaseModel):
     company_name: str
     field_name: str
     history: list[dict]
+
+
+@app.get("/me")
+def get_me(user_id: str | None = Depends(get_current_user)):
+    """Returns the current user's tier and usage."""
+    if not user_id or not DATABASE_URL:
+        return {"tier": "free", "reports_used": 0, "reports_limit": 10}
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT tier, reports_used_this_month FROM user_tiers WHERE user_id = %s", (user_id,))
+        row = cur.fetchone()
+        cur.close(); conn.close()
+        if not row:
+            return {"tier": "free", "reports_used": 0, "reports_limit": 10}
+        tier, used = row
+        limit = TIER_LIMITS.get(tier, 10)
+        return {"tier": tier, "reports_used": used, "reports_limit": limit}
+    except Exception:
+        logger.exception("Failed to fetch user tier")
+        return {"tier": "free", "reports_used": 0, "reports_limit": 10}
 
 
 @app.get("/reports")
