@@ -2702,38 +2702,53 @@ export default function ConcallTool() {
                     display: "flex", flexDirection: "column", gap: "12px",
                   }}
                 >
-                  {plan.highlight && (
-                    <div style={{ position: "absolute", top: "-12px", left: "50%", transform: "translateX(-50%)", background: t.accent, color: "#fff", fontSize: "10px", fontWeight: 700, padding: "3px 10px", borderRadius: "20px", letterSpacing: "0.08em", whiteSpace: "nowrap" }}>
-                      MOST POPULAR
-                    </div>
-                  )}
-                  <div style={{ fontSize: "13px", fontWeight: 700, color: t.ink, letterSpacing: "0.04em" }}>{plan.name.toUpperCase()}</div>
-                  <div>
-                    <div style={{ fontSize: "22px", fontWeight: 700, color: t.ink }}>{plan.price.in}</div>
-                    <div style={{ fontSize: "11px", color: t.inkFaint }}>{plan.price.intl} international</div>
-                  </div>
-                  <div style={{ fontSize: "11.5px", color: t.accent, fontWeight: 600 }}>{plan.reports}</div>
-                  <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: "7px", flex: 1 }}>
-                    {plan.features.map(f => (
-                      <li key={f} style={{ fontSize: "12px", color: t.inkMuted, display: "flex", gap: "7px", alignItems: "flex-start" }}>
-                        <span style={{ color: t.accent, fontWeight: 700, flexShrink: 0 }}>✓</span> {f}
-                      </li>
-                    ))}
-                  </ul>
-                  <button
-                    disabled={plan.ctaDisabled || checkoutLoading === plan.name.toLowerCase()}
-                    onClick={() => { if (!plan.ctaDisabled) handleUpgrade(plan.name.toLowerCase()); }}
-                    style={{
-                      marginTop: "8px", width: "100%", padding: "10px", borderRadius: "8px", fontSize: "12.5px", fontWeight: 600,
-                      cursor: plan.ctaDisabled ? "default" : "pointer",
-                      background: plan.ctaDisabled ? t.bgSubtle : plan.highlight ? t.accent : t.ink,
-                      color: plan.ctaDisabled ? t.inkFaint : "#fff",
-                      border: "none",
-                      opacity: (plan.ctaDisabled || checkoutLoading === plan.name.toLowerCase()) ? 0.7 : 1,
-                    }}
-                  >
-                    {checkoutLoading === plan.name.toLowerCase() ? "Loading…" : plan.cta}
-                  </button>
+                  {(() => {
+                    const isCurrentPlan = userTier.tier === plan.name.toLowerCase();
+                    const tierOrder = ["free", "growth", "pro", "elite"];
+                    const isDowngrade = tierOrder.indexOf(plan.name.toLowerCase()) < tierOrder.indexOf(userTier.tier);
+                    const isDisabled = isCurrentPlan || isDowngrade;
+                    return (
+                      <>
+                        {plan.highlight && !isCurrentPlan && (
+                          <div style={{ position: "absolute", top: "-12px", left: "50%", transform: "translateX(-50%)", background: t.accent, color: "#fff", fontSize: "10px", fontWeight: 700, padding: "3px 10px", borderRadius: "20px", letterSpacing: "0.08em", whiteSpace: "nowrap" }}>
+                            MOST POPULAR
+                          </div>
+                        )}
+                        {isCurrentPlan && (
+                          <div style={{ position: "absolute", top: "-12px", left: "50%", transform: "translateX(-50%)", background: "#3FAE85", color: "#fff", fontSize: "10px", fontWeight: 700, padding: "3px 10px", borderRadius: "20px", letterSpacing: "0.08em", whiteSpace: "nowrap" }}>
+                            YOUR PLAN
+                          </div>
+                        )}
+                        <div style={{ fontSize: "13px", fontWeight: 700, color: t.ink, letterSpacing: "0.04em" }}>{plan.name.toUpperCase()}</div>
+                        <div>
+                          <div style={{ fontSize: "22px", fontWeight: 700, color: t.ink }}>{plan.price.in}</div>
+                          <div style={{ fontSize: "11px", color: t.inkFaint }}>{plan.price.intl} international</div>
+                        </div>
+                        <div style={{ fontSize: "11.5px", color: t.accent, fontWeight: 600 }}>{plan.reports}</div>
+                        <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: "7px", flex: 1 }}>
+                          {plan.features.map(f => (
+                            <li key={f} style={{ fontSize: "12px", color: t.inkMuted, display: "flex", gap: "7px", alignItems: "flex-start" }}>
+                              <span style={{ color: t.accent, fontWeight: 700, flexShrink: 0 }}>✓</span> {f}
+                            </li>
+                          ))}
+                        </ul>
+                        <button
+                          disabled={isDisabled || checkoutLoading === plan.name.toLowerCase()}
+                          onClick={() => { if (!isDisabled) handleUpgrade(plan.name.toLowerCase()); }}
+                          style={{
+                            marginTop: "8px", width: "100%", padding: "10px", borderRadius: "8px", fontSize: "12.5px", fontWeight: 600,
+                            cursor: isDisabled ? "default" : "pointer",
+                            background: isCurrentPlan ? "#3FAE8520" : isDisabled ? t.bgSubtle : plan.highlight ? t.accent : t.ink,
+                            color: isCurrentPlan ? "#3FAE85" : isDisabled ? t.inkFaint : "#fff",
+                            border: isCurrentPlan ? "1px solid #3FAE85" : "none",
+                            opacity: (!isCurrentPlan && isDisabled) || checkoutLoading === plan.name.toLowerCase() ? 0.5 : 1,
+                          }}
+                        >
+                          {checkoutLoading === plan.name.toLowerCase() ? "Loading…" : isCurrentPlan ? "Current plan ✓" : isDowngrade ? "Downgrade" : plan.cta}
+                        </button>
+                      </>
+                    );
+                  })()}
                 </div>
               ))}
             </div>

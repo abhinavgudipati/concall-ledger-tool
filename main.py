@@ -64,6 +64,7 @@ if not DATABASE_URL:
 
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
+RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
 rzp_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)) if RAZORPAY_KEY_ID else None
 
 TIER_PRICES_INR = {
@@ -318,7 +319,7 @@ def create_order(body: CreateOrderRequest, user_id: str | None = Depends(get_cur
 async def razorpay_webhook(request: Request):
     body_bytes = await request.body()
     sig = request.headers.get("X-Razorpay-Signature", "")
-    expected = hmac.new(RAZORPAY_KEY_SECRET.encode(), body_bytes, hashlib.sha256).hexdigest() if RAZORPAY_KEY_SECRET else ""  # noqa: S324
+    expected = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode(), body_bytes, hashlib.sha256).hexdigest() if RAZORPAY_WEBHOOK_SECRET else ""
     if not hmac.compare_digest(expected, sig):
         raise HTTPException(status_code=400, detail="Invalid signature.")
 
