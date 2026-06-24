@@ -958,6 +958,7 @@ def get_reports(user_id: str | None = Depends(get_current_user)):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        logger.info(f"Fetching reports for user_id='{user_id}'")
         cur.execute(
             """
             SELECT company_name, quarter_year, MAX(extracted_at) as extracted_at
@@ -969,6 +970,7 @@ def get_reports(user_id: str | None = Depends(get_current_user)):
             (user_id,),
         )
         rows = cur.fetchall()
+        logger.info(f"Found {len(rows)} reports for user_id='{user_id}'")
         cur.close()
         conn.close()
         return {"reports": [{"company_name": r[0], "quarter_year": r[1], "extracted_at": r[2].isoformat()} for r in rows]}
